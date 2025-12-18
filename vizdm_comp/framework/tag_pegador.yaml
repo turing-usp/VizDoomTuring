@@ -1,0 +1,30 @@
+name: "Pegador"
+colorset: 1 # (Cor Vermelha)
+
+engine_reward:
+  # --- O OBJETIVO ---
+  # Recompensa alta por "tocar" no fugitivo (dar dano com o soco)
+  damage_made_reward: 10.0 
+  
+  # --- PENALIDADES ---
+  # Não é penalizado por ser "tocado" de volta
+  damage_taken_penalty: 0.0
+  # Penalidade alta se acidentalmente matar o outro
+  frag_reward: -100.0
+
+shaping:
+  w_deaths: -100.0
+  # Sem penalidade de tempo. O objetivo é apenas caçar.
+  step_penalty: 0.0
+  include_engine_reward: true # Usa as recompensas acima
+
+policy:
+  algo: "ppo"
+  # ... (pode copiar a política do tag_agent.yaml) ...
+  policy_kwargs: { net_arch: { pi: [128, 64], vf: [128, 64] } }
+  learn_kwargs: { n_steps: 256, learning_rate: 3e-4, gamma: 0.99 }
+
+model_dir: "models"
+model_name: "pegador_bot.zip"
+train: true
+train_steps: 300000

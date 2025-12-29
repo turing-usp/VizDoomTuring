@@ -11,10 +11,18 @@ class DMConfig:
     total_players: int = 5
     port: int = 5029
     join_ip: str = "127.0.0.1"
+
+    # Map control
     map_name: str = "map01"
+    # Optional extra content file:
+    # - filename inside framework/maps (with or without .wad/.pk3)
+    # - OR absolute/relative path to an existing file
+    wad: Optional[str] = None
+
     timelimit_minutes: float = 3.0
     render: bool = False
-    frame_skip: int = 4
+
+    frame_skip: int = 8
     screen_w: int = 160
     screen_h: int = 120
     stack_frames: int = 4
@@ -60,11 +68,11 @@ class RenderSettingsConfig:
     Configurações visuais do VizDoom.
 
     - A janela de renderização (tela que você vê) será configurada em alta resolução
-      diretamente no env.py (ex.: RES_640X480).
+      diretamente no env.py quando render=True.
     - 'resolution' define a resolução da OBSERVAÇÃO da REDE (o que vai para o modelo).
     """
-    resolution: str = "RES_160X120"  # Resolução da REDE (ex.: RES_120X90, RES_160X120)
-    format: str = "GRAY8"            # Formato da janela/render (RGB24 ou GRAY8)
+    resolution: str = "RES_160X120"  # Ex.: RES_120X90, RES_160X120
+    format: str = "GRAY8"            # RGB24 ou GRAY8
     hud: bool = False                # Mostrar interface
 
 
@@ -105,6 +113,9 @@ class AgentConfig:
     policy: PolicyConfig = PolicyConfig()
     model_dir: str = "models"
     model_name: str = "agent.zip"
+
     train: bool = False
     train_steps: int = 300_000
     stack_frames: int = 4
+
+  

@@ -24,7 +24,9 @@ Uso exemplo:
         --agent bob.yaml:4 \
         --num-matches 1 \
         --game-port 5029 \
-        --stack 4
+        --stack 4 \
+        --map map01 \
+        --wad mypack.wad
 """
 
 import argparse
@@ -35,7 +37,7 @@ import sys
 import time
 from dataclasses import dataclass
 from multiprocessing.connection import Listener, Connection
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv, VecTransposeImage, VecFrameStack
@@ -174,6 +176,18 @@ def parse_args() -> argparse.Namespace:
         help="Quantidade de steps por chunk de treino para cada modelo.",
     )
 
+    # --- NEW: map and wad passed to every actor ---
+    parser.add_argument(
+        "--map",
+        default="map01",
+        help="Nome do mapa (ex.: map01, MAP01). Será passado a todos os atores.",
+    )
+    parser.add_argument(
+        "--wad",
+        default=None,
+        help="WAD/PK3 (nome em framework/maps/ OU caminho completo). Será passado a todos os atores.",
+    )
+
     return parser.parse_args()
 
 
@@ -193,7 +207,6 @@ def start_listener(args: argparse.Namespace, backlog: int) -> Tuple[Listener, Tu
 
 
 def _build_actor_cmd_single(
-    module_name: str,
     cfg_path: str,
     players_per_match: int,
     game_ip: str,
@@ -204,10 +217,15 @@ def _build_actor_cmd_single(
     auth_key: str,
     is_host: bool,
     render_mode: str,
+    map_name: str,
+    wad: Optional[str],
 ) -> List[str]:
     """
     Monta comando para lançar 1 ator remoto do módulo distributed_actor
-    com o YAML específico. O próprio YAML define train/train_steps/policy/etc.
+    com o YAML específico.
+
+    Além do YAML, passamos parâmetros de mapa/WAD para garantir que todos
+    os atores carreguem exatamente o mesmo conteúdo.
     """
     cmd = [
         sys.executable,
@@ -229,7 +247,12 @@ def _build_actor_cmd_single(
         str(trainer_port),
         "--auth-key",
         auth_key,
+        "--map",
+        str(map_name),
     ]
+    if wad:
+        cmd += ["--wad", str(wad)]
+
     if is_host:
         cmd.append("--is-host")
         if render_mode in ("host", "all"):
@@ -269,7 +292,6 @@ def launch_multi_model_actors(
         host_spec = agent_specs[0]
         print(f"[MM-TRAIN] Lançando HOST com {host_spec.cfg_path} ...")
         host_cmd = _build_actor_cmd_single(
-            module_name="vizdm_comp.framework.distributed_actor",
             cfg_path=host_spec.cfg_path,
             players_per_match=players_per_match,
             game_ip=args.game_ip,
@@ -280,6 +302,8 @@ def launch_multi_model_actors(
             auth_key=args.auth_key,
             is_host=True,
             render_mode=render_mode,
+            map_name=args.map,
+            wad=args.wad,
         )
         print("[MM-TRAIN][CMD-HOST]", " ".join(host_cmd))
         p = subprocess.Popen(host_cmd)
@@ -299,7 +323,6 @@ def launch_multi_model_actors(
                 continue
             for local_idx in range(remaining):
                 cmd = _build_actor_cmd_single(
-                    module_name="vizdm_comp.framework.distributed_actor",
                     cfg_path=spec.cfg_path,
                     players_per_match=players_per_match,
                     game_ip=args.game_ip,
@@ -310,6 +333,8 @@ def launch_multi_model_actors(
                     auth_key=args.auth_key,
                     is_host=False,
                     render_mode=render_mode,
+                    map_name=args.map,
+                    wad=args.wad,
                 )
                 print(
                     f"[MM-TRAIN]   Cliente match={match_idx}, "
@@ -357,6 +382,7 @@ class GroupRuntime:
     save_path: str
     callback: DebugCallback
 
+
 def build_group_runtimes(
     agent_specs: List[AgentGroupSpec],
     conns: List[Connection],
@@ -382,7 +408,7 @@ def build_group_runtimes(
     # 1) Reset inicial em todos os atores para descobrir 'name'
     print("[MM-TRAIN] Fazendo reset inicial em todos os atores para leitura de info['name']...")
     actor_names: List[str] = []
-    for idx, c in enumerate(conns):
+    for c in conns:
         c.send({"cmd": "reset"})
     for idx, c in enumerate(conns):
         msg = c.recv()
@@ -489,6 +515,7 @@ def build_group_runtimes(
 
     return group_runtimes
 
+
 # ======================================================================
 # Loop principal multi-modelo
 # ======================================================================
@@ -512,7 +539,6 @@ def train_multi_models(
         print("[MM-TRAIN] Nenhum grupo para treinar.")
         return
 
-    # Quanto cada modelo ainda deve treinar (pode ser diferente entre YAMLs)
     remaining_per_group: Dict[str, int] = {}
 
     for rt in groups:
@@ -528,7 +554,6 @@ def train_multi_models(
             f"ja_treinado={already}, restante={remaining}"
         )
 
-    # Loop até todos os modelos encerrarem seu treino
     while True:
         all_done = True
 
@@ -539,7 +564,7 @@ def train_multi_models(
                 continue
 
             all_done = False
-            cur = min(chunk_steps, remaining)
+            cur = min(int(chunk_steps), int(remaining))
             print(
                 f"[MM-TRAIN][{key}] Iniciando chunk de treino: {cur} steps "
                 f"(restam {remaining})"
@@ -559,6 +584,7 @@ def train_multi_models(
 
     print("[MM-TRAIN] Treino multi-modelo concluído.")
 
+
 # ======================================================================
 # main()
 # ======================================================================
@@ -566,7 +592,6 @@ def train_multi_models(
 def main() -> None:
     args = parse_args()
 
-    # Converte specs
     agent_specs: List[AgentGroupSpec] = [parse_agent_spec(s) for s in args.agent]
 
     for spec in agent_specs:
@@ -579,6 +604,8 @@ def main() -> None:
         f"{total_actors_per_match} atores por partida, "
         f"{total_actors} atores no total."
     )
+
+    print(f"[MM-TRAIN] Map={args.map!r} | Wad={args.wad!r}")
 
     listener, _ = start_listener(args, backlog=total_actors)
 

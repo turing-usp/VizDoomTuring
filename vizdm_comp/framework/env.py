@@ -4,15 +4,13 @@ import gymnasium as gym
 from gymnasium import spaces
 import vizdoom as vzd
 from vizdoom import Mode, Button, GameVariable
+import cv2
+import os
 
 from .config import DMConfig, AgentConfig
 from .rewards import RewardShaper, apply_engine_rewards
 
-import os
-
-# --- LISTAS DE AÇÕES GLOBAIS (ATUALIZADAS) ---
-
-# Ações para o modo Deathmatch (sem alteração)
+# --- LISTAS DE AÇÕES GLOBAIS ---
 actions_deathmatch = np.asarray([
     [0,0,0,0,0,0], [0,0,1,0,0,0], [0,0,0,1,0,0], [0,0,0,0,1,0],
     [0,0,1,0,0,1], [1,0,0,0,0,0], [0,1,0,0,0,0], [0,0,0,0,0,1]
@@ -22,50 +20,57 @@ buttons_deathmatch = [
     Button.TURN_LEFT, Button.TURN_RIGHT, Button.ATTACK
 ]
 
-# --- AÇÕES ATUALIZADAS PARA O MODO "PEGA-PEGA" ---
 buttons_tag = [
     Button.MOVE_FORWARD,
     Button.MOVE_BACKWARD,
     Button.TURN_LEFT, 
     Button.TURN_RIGHT,
     Button.SPEED,
-    Button.ATTACK  # <-- RE-ADICIONADO
+    Button.ATTACK 
 ]
 actions_tag = np.asarray([
-    # [FWD, BWD, T_LEFT, T_RIGHT, SPEED, ATTACK]
-    [0,0,0,0,0,0], # 0: Nada
-    [1,0,0,0,0,0], # 1: Mover Frente
-    [1,0,0,0,1,0], # 2: Correr Frente
-    [0,1,0,0,0,0], # 3: Mover Trás
-    [0,0,1,0,0,0], # 4: Virar Esquerda
-    [0,0,0,1,0,0], # 5: Virar Direita
-    [1,0,0,0,0,1], # 6: Frente + Soco (Pega!)
-    [1,0,0,0,1,1]  # 7: Correr + Soco (Pega!)
+    [0,0,0,0,0,0], 
+    [1,0,0,0,0,0], 
+    [1,0,0,0,1,0], 
+    [0,1,0,0,0,0], 
+    [0,0,1,0,0,0], 
+    [0,0,0,1,0,0], 
+    [1,0,0,0,0,1], 
+    [1,0,0,0,1,1]  
 ], dtype=np.int32)
-# --- FIM DAS ATUALIZAÇÕES ---
 
 
 class DoomDMEnv(gym.Env):
-    """
-    Env single-agent (host OU cliente) para deathmatch VizDoom.
-    Reward = shaping (+ opcional reward nativo do engine).
-    Observação HWC; wrappers externos fazem CHW/stack.
-    """
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, name: str, is_host: bool, dm: DMConfig, agent: AgentConfig):
+    def __init__(self, name: str, is_host: bool, dm: DMConfig, agent_config: AgentConfig):
         super().__init__()
         self.name = name
         self.is_host = is_host
         self.dm = dm
-        self.agent = agent
-
+        self.agent = agent_config
+        
         g = self.game = vzd.DoomGame()
+        
+        # 1. Carrega o Config (Isso muda o diretório base de busca do VizDoom)
         g.load_config(dm.config_file)
+        
+        # --- CORREÇÃO DO CAMINHO DO WAD ---
+        # Se um WAD foi especificado, pegamos o caminho ABSOLUTO dele.
+        # Isso impede que o VizDoom procure dentro da pasta vizdm_comp/framework.
+        if self.dm.wad:
+            wad_abs_path = os.path.abspath(self.dm.wad)
+            # Verifica se o arquivo existe antes de mandar pro jogo
+            if not os.path.exists(wad_abs_path):
+                 print(f"ERRO CRÍTICO: WAD não encontrado em: {wad_abs_path}")
+            g.set_doom_scenario_path(wad_abs_path)
+        # ----------------------------------
+
         g.set_doom_map(self.dm.map_name)
         g.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
-        g.set_screen_format(vzd.ScreenFormat.RGB24)
-        g.set_render_hud(False); g.set_render_crosshair(False)
+        g.set_screen_format(vzd.ScreenFormat.GRAY8)
+        g.set_render_hud(False)
+        g.set_render_crosshair(False)
         g.set_window_visible(self.dm.render)
 
         config_filename = os.path.basename(dm.config_file)
@@ -85,7 +90,6 @@ class DoomDMEnv(gym.Env):
             
         g.set_available_buttons(available_buttons)
 
-        # Variáveis para shaping/infos
         g.add_available_game_variable(GameVariable.HEALTH)
         g.add_available_game_variable(GameVariable.ARMOR)
         g.add_available_game_variable(GameVariable.AMMO2)
@@ -96,7 +100,7 @@ class DoomDMEnv(gym.Env):
 
         apply_engine_rewards(g, self.agent.engine_reward)
 
-        g.set_mode(Mode.ASYNC_PLAYER)  # multiplayer exige
+        g.set_mode(Mode.ASYNC_PLAYER) 
 
         common = (
             f"-deathmatch +timelimit {self.dm.timelimit_minutes} "
@@ -108,6 +112,8 @@ class DoomDMEnv(gym.Env):
         else:
             args = f"-join {self.dm.join_ip} -port {self.dm.port} "
         g.add_game_args(args + common)
+        
+        # Agora o init deve funcionar pois o caminho do WAD é absoluto
         g.init()
 
 
@@ -115,25 +121,24 @@ class DoomDMEnv(gym.Env):
         self._last_obs: Optional[np.ndarray] = None
 
         H, W = self.dm.screen_h, self.dm.screen_w
-        self.observation_space = spaces.Box(low=0, high=255, shape=(H, W, 3), dtype=np.uint8)
+        self.observation_space = spaces.Box(low=0, high=255, shape=(H, W, 1), dtype=np.uint8)
         self.action_space = spaces.Discrete(len(self._actions))
 
-        self.shaper = RewardShaper(self.agent.shaping)
-        self._last_obs: Optional[np.ndarray] = None
+    def _read_obs(self):
+        state = self.game.get_state()
+        if state is None:
+            return np.zeros(self.observation_space.shape, dtype=np.uint8)
 
-    def _read_obs(self) -> np.ndarray:
-        st = self.game.get_state()
-        if st is None:
-            return self._last_obs if self._last_obs is not None else np.zeros(
-                (self.dm.screen_h, self.dm.screen_w, 3), dtype=np.uint8
-            )
-        buf = st.screen_buffer
-        if buf.ndim != 3:
-            raise RuntimeError(f"Unexpected screen_buffer shape: {buf.shape}")
-        img = buf.transpose(1,2,0) if buf.shape[0] == 3 else buf  # CHW->HWC ou já HWC
-        img = np.ascontiguousarray(img)
-        self._last_obs = img
-        return img
+        buf = state.screen_buffer
+        target_w = self.dm.screen_w
+        target_h = self.dm.screen_h
+        
+        if buf.shape[0] != target_h or buf.shape[1] != target_w:
+             buf = cv2.resize(buf, (target_w, target_h), interpolation=cv2.INTER_AREA)
+        
+        if buf.ndim == 2:
+            buf = buf[..., None]
+        return buf
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -154,14 +159,13 @@ class DoomDMEnv(gym.Env):
         if self.game.is_player_dead():
             self.game.respawn_player()
         a = self._actions[action].tolist()
-        engine_r = float(self.game.make_action(a, self.dm.frame_skip))  # reward do engine
+        engine_r = float(self.game.make_action(a, self.dm.frame_skip))
         shaped_r = self.shaper.compute(self.game, engine_r)
         done = self.game.is_episode_finished()
         obs = self._read_obs()
         return obs, shaped_r, done, False, {"engine_r": engine_r}
 
     def render(self): pass
-
     def close(self):
         try: self.game.close()
         except: pass

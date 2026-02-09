@@ -39,6 +39,7 @@ if __name__ == "__main__":
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--timelimit", type=float, default=3.0)
     ap.add_argument("--stack", type=int, default=4)
+
     args = ap.parse_args()
 
     agent = load_agent_cfg(args.cfg)

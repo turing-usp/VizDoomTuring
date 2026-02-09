@@ -1,0 +1,39 @@
+name: "Fugitivo"
+colorset: 8 # (Cor Verde)
+
+engine_reward:
+  # --- O OBJETIVO ---
+  # Recompensa pequena e constante por estar vivo
+  living_reward: 0.01 
+
+  # --- PENALIDADES ---
+  # Penalidade alta por ser "tocado" pelo pegador
+  damage_taken_penalty: -10.0
+  # Penalidade por acidentalmente "tocar" no pegador (ex: dar um soco)
+  damage_made_reward: -1.0
+  frag_reward: -100.0
+
+shaping:
+  w_deaths: -100.0
+  # O step_penalty aqui é zero, pois já usamos o living_reward
+  step_penalty: 0.0
+  include_engine_reward: true # Usa as recompensas acima
+
+policy:
+  algo: "ppo"
+  policy_kwargs:
+    # Reduzir a rede neural. Pega-Pega é simples, não precisa de 128 neurônios.
+    net_arch:
+      pi: [64, 64] # Era [128, 64]
+      vf: [64, 64]
+  learn_kwargs:
+    n_steps: 2048
+    batch_size: 64
+    
+    learning_rate: 3e-4
+    n_epochs: 4 # Quantas vezes ele repassa os dados. Menos epochs = treino mais rápido (mas talvez menos estável)
+
+model_dir: "models"
+model_name: "/kaggle/working/fugitivo_bot.zip"
+train: true
+train_steps: 1250000

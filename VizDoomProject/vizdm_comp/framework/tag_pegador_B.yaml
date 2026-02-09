@@ -1,0 +1,32 @@
+name: "Pegador_B"
+colorset: 2 # Cor diferente do Pegador A
+
+engine_reward:
+  # Lógica idêntica ao Pegador A
+  damage_made_reward: 10.0 
+  damage_taken_penalty: 0.0
+  frag_reward: -100.0
+
+shaping:
+  w_deaths: -100.0
+  step_penalty: 0.0
+  include_engine_reward: true
+
+policy:
+  algo: "ppo"
+  policy_kwargs:
+    # Reduzir a rede neural. Pega-Pega é simples, não precisa de 128 neurônios.
+    net_arch:
+      pi: [64, 64] # Era [128, 64]
+      vf: [64, 64]
+  learn_kwargs:
+    n_steps: 2048
+    batch_size: 64
+    
+    learning_rate: 3e-4
+    n_epochs: 4 # Quantas vezes ele repassa os dados. Menos epochs = treino mais rápido (mas talvez menos estável)
+
+model_dir: "models"
+model_name: "/kaggle/working/pegador_bot_B.zip" # <-- Salva em arquivo diferente!
+train: true
+train_steps: 750000

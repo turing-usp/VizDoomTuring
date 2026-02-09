@@ -5,9 +5,26 @@ AlgoName = Literal["ppo", "a2c", "dqn", "external"]
 ExtractorName = Literal["cnn_default", "custom"]
 
 @dataclass(frozen=True)
+class RenderSettingsConfig:
+    resolution: str = "RES_160X120"
+    format: str = "CRCGCB"
+    render_hud: bool = False
+    render_crosshair: bool = False
+    render_weapon: bool = True
+    render_decals: bool = False
+    render_particles: bool = False
+    window_visible: bool = False
+
+@dataclass(frozen=True)
 class DMConfig:
     """Config do servidor/jogo multiplayer."""
     config_file: str = "tag.cfg"
+    
+    # --- CORREÇÃO DO ERRO ATUAL ---
+    # Adicionamos o campo 'wad' para o ator conseguir salvar essa info
+    wad: Optional[str] = "freedm.wad"
+    # ------------------------------
+
     total_players: int = 5
     port: int = 5029
     join_ip: str = "127.0.0.1"
@@ -15,15 +32,14 @@ class DMConfig:
     timelimit_minutes: float = 3.0
     render: bool = False
     frame_skip: int = 4
-    screen_w: int = 160
-    screen_h: int = 120
+    screen_w: int = 84
+    screen_h: int = 84
     stack_frames: int = 4
 
 @dataclass(frozen=True)
 class EngineRewardConfig:
     """
-    Recompensas nativas do ViZDoom (entram no retorno de make_action()).
-    Use zero para desligar um canal. Alguns campos requerem ViZDoom >= 1.3.0.
+    Recompensas nativas do ViZDoom.
     """
     living_reward: float = 0.0
     frag_reward: float = 0.0
@@ -39,38 +55,49 @@ class EngineRewardConfig:
 @dataclass(frozen=True)
 class ShapingConfig:
     """
-    Recompensa própria do agente (ex.: deltas de variáveis).
+    Recompensa própria do agente.
     """
-    w_frag: float = 1.0          # ΔFRAGCOUNT
-    w_health: float = 0.0        # ΔHEALTH
-    w_armor: float = 0.0         # ΔARMOR
-    w_ammo2_cost: float = 0.0    # penaliza gasto de AMMO2
-    w_hits: float = 0.0          # ΔHITCOUNT
-    w_hits_taken: float = 0.0    # -ΔHITS_TAKEN (use negativo)
-    w_deaths: float = 0.0        # -ΔDEATHCOUNT (use negativo)
+    w_frag: float = 1.0          
+    w_health: float = 0.0        
+    w_armor: float = 0.0         
+    w_ammo2_cost: float = 0.0    
+    w_hits: float = 0.0          
+    w_hits_taken: float = 0.0    
+    w_deaths: float = 0.0        
     step_penalty: float = 0.0
-    include_engine_reward: bool = False  # soma reward do engine?
+    include_engine_reward: bool = False 
 
 @dataclass(frozen=True)
 class PolicyConfig:
     """Escolha do algoritmo, extrator e hiperparâmetros."""
     algo: AlgoName = "ppo"
     extractor: ExtractorName = "cnn_default"
-    external_path: Optional[str] = None   # .pth (quando algo == "external")
+    external_path: Optional[str] = None   
     policy_kwargs: Dict[str, Any] = field(default_factory=dict)
     learn_kwargs: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class AgentConfig:
     """
-    Config por agente. Cada cliente lê o SEU YAML e treina/joga com essas regras.
+    Config por agente.
     """
     name: str = "Agent"
     colorset: int = 3
-    engine_reward: EngineRewardConfig = EngineRewardConfig()
-    shaping: ShapingConfig = ShapingConfig()
-    policy: PolicyConfig = PolicyConfig()
+    
+    # Render settings vindo do YAML
+    render_settings: RenderSettingsConfig = field(default_factory=RenderSettingsConfig)
+    
+    engine_reward: EngineRewardConfig = field(default_factory=EngineRewardConfig)
+    shaping: ShapingConfig = field(default_factory=ShapingConfig)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
+    
     model_dir: str = "models"
-    model_name: str = "agent.zip"    # SB3
+    model_name: str = "agent.zip"    
     train: bool = False
     train_steps: int = 300_000
+
+@dataclass(frozen=True)
+class RewardConfig:
+    """Container para Engine e Shaping (necessário para distributed_actor)"""
+    engine: EngineRewardConfig
+    shaping: ShapingConfig

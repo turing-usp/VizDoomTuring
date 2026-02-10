@@ -52,19 +52,24 @@ class DoomDMEnv(gym.Env):
         
         g = self.game = vzd.DoomGame()
         
-        # 1. Carrega o Config (Isso muda o diretório base de busca do VizDoom)
-        g.load_config(dm.config_file)
+        # --- MUDANÇA CRUCIAL: NÃO CARREGAMOS MAIS O CONFIG (tag.cfg) ---
+        # g.load_config(dm.config_file)  <-- REMOVIDO PARA EVITAR DEADLOCK
+        # ---------------------------------------------------------------
         
-        # --- CORREÇÃO DO CAMINHO DO WAD ---
-        # Se um WAD foi especificado, pegamos o caminho ABSOLUTO dele.
-        # Isso impede que o VizDoom procure dentro da pasta vizdm_comp/framework.
+        # Configuração Manual do WAD (Agora única fonte da verdade)
         if self.dm.wad:
-            wad_abs_path = os.path.abspath(self.dm.wad)
-            # Verifica se o arquivo existe antes de mandar pro jogo
-            if not os.path.exists(wad_abs_path):
-                 print(f"ERRO CRÍTICO: WAD não encontrado em: {wad_abs_path}")
-            g.set_doom_scenario_path(wad_abs_path)
-        # ----------------------------------
+            root_dir = os.getcwd()
+            wad_candidate_root = os.path.join(root_dir, self.dm.wad)
+            framework_dir = os.path.dirname(os.path.abspath(__file__))
+            wad_candidate_fw = os.path.join(framework_dir, os.path.basename(self.dm.wad))
+
+            if os.path.exists(wad_candidate_root):
+                # Força ser o IWAD (Jogo Base) para evitar carregar freedoom2.wad junto
+                g.set_doom_game_path(wad_candidate_root)
+            elif os.path.exists(wad_candidate_fw):
+                g.set_doom_game_path(wad_candidate_fw)
+            else:
+                print(f"[ENV] AVISO: WAD {self.dm.wad} não encontrado, VizDoom tentará padrão.")
 
         g.set_doom_map(self.dm.map_name)
         g.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
@@ -73,7 +78,8 @@ class DoomDMEnv(gym.Env):
         g.set_render_crosshair(False)
         g.set_window_visible(self.dm.render)
 
-        config_filename = os.path.basename(dm.config_file)
+        # Detecta modo de jogo pelo nome do arquivo (string), sem abrir o arquivo
+        config_filename = str(dm.config_file).lower()
 
         if "tag" in config_filename:
             self.game_mode = "tag"
@@ -102,20 +108,26 @@ class DoomDMEnv(gym.Env):
 
         g.set_mode(Mode.ASYNC_PLAYER) 
 
+        # Adicionamos -nosound e -noconsole para garantir performance e evitar travar audio
         common = (
             f"-deathmatch +timelimit {self.dm.timelimit_minutes} "
             f"+sv_forcerespawn 1 +sv_noautoaim 1 +sv_respawnprotect 1 +sv_spawnfarthest 1 "
             f"-skill 3 +name {self.name} +colorset {self.agent.colorset} "
+            f"-nosound -noconsole "
         )
         if self.is_host:
-            args = f"-host {self.dm.total_players} -port {self.dm.port} +viz_connect_timeout 300 "
+            args = f"-host {self.dm.total_players} -port {self.dm.port} +viz_connect_timeout 60 "
         else:
             args = f"-join {self.dm.join_ip} -port {self.dm.port} "
         g.add_game_args(args + common)
         
-        # Agora o init deve funcionar pois o caminho do WAD é absoluto
-        g.init()
-
+        print(f"[ENV DEBUG] Tentando iniciar VizDoom (g.init) para: {self.name} | Host={self.is_host}")
+        try:
+            g.init()
+            print(f"[ENV DEBUG] VizDoom INICIADO com sucesso para: {self.name}")
+        except Exception as e:
+            print(f"[ENV DEBUG] ERRO FATAL ao iniciar VizDoom para {self.name}: {e}")
+            raise e
 
         self.shaper = RewardShaper(self.agent.shaping)
         self._last_obs: Optional[np.ndarray] = None

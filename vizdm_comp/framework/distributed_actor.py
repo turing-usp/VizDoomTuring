@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-from .env import DoomDMEnv 
+
 import argparse
 import time
 from multiprocessing import shared_memory
 from multiprocessing.connection import Client, Connection
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import numpy as np
 import yaml
+import sys
 
+# Ajuste conforme a estrutura do seu projeto
 from .config import (
     DMConfig,
     AgentConfig,
@@ -17,7 +19,6 @@ from .config import (
     ShapingConfig,
     PolicyConfig,
     RenderSettingsConfig,
-    RewardConfig,
 )
 from .env import DoomDMEnv
 
@@ -33,44 +34,56 @@ def _agentconfig_supports(field_name: str) -> bool:
         return False
 
 
-def load_agent_cfg_light(cfg_path: str) -> AgentConfig:
-    """
-    Carrega o YAML e converte dicionários aninhados nas DataClasses corretas.
-    Resolve o problema da chave 'reward' e 'render_settings'.
-    """
-    import yaml # Garante que yaml está importado
-    
-    with open(cfg_path, "r") as f:
-        data = yaml.safe_load(f)
+def load_agent_cfg_light(yaml_path: str) -> AgentConfig:
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        y = yaml.safe_load(f) or {}
 
-    # --- CORREÇÃO 1: Tratamento da chave 'reward' ---
-    # Se o YAML tem 'reward', nós extraímos 'engine' e 'shaping' de dentro dele
-    if "reward" in data:
-        reward_data = data.pop("reward") # Remove a chave 'reward'
-        
-        # Converte o dicionário 'engine' em objeto EngineRewardConfig
-        if "engine" in reward_data:
-            data["engine_reward"] = EngineRewardConfig(**reward_data["engine"])
-            
-        # Converte o dicionário 'shaping' em objeto ShapingConfig
-        if "shaping" in reward_data:
-            data["shaping"] = ShapingConfig(**reward_data["shaping"])
+    # 1. Ler Engine Reward
+    reward_block = y.get("reward", {})
+    if "engine" in reward_block:
+        er_data = reward_block["engine"]
+    else:
+        er_data = y.get("engine_reward", {})
+    er = EngineRewardConfig(**er_data)
 
-    # --- CORREÇÃO 2: Tratamento da chave 'render_settings' ---
-    # Se tiver render_settings como dicionário, converte para objeto
-    if "render_settings" in data and isinstance(data["render_settings"], dict):
-        data["render_settings"] = RenderSettingsConfig(**data["render_settings"])
+    # 2. Ler Shaping
+    if "shaping" in reward_block:
+        sh_data = reward_block["shaping"]
+    else:
+        sh_data = y.get("shaping", {})
+    sh = ShapingConfig(**sh_data)
 
-    # --- CORREÇÃO 3: Tratamento de Policy e Engine (caso venham como dict) ---
-    # O Python não converte dict para dataclass automaticamente aninhado
-    if "engine_reward" in data and isinstance(data["engine_reward"], dict):
-        data["engine_reward"] = EngineRewardConfig(**data["engine_reward"])
-        
-    if "shaping" in data and isinstance(data["shaping"], dict):
-        data["shaping"] = ShapingConfig(**data["shaping"])
+    # 3. Ler Policy
+    pol = PolicyConfig(**y.get("policy", {}))
 
-    # Agora criamos o AgentConfig com os dados limpos
-    return AgentConfig(**data)
+    # 4. Ler Render Settings
+    rs_data = y.get("render_settings", {})
+    rs = RenderSettingsConfig(**rs_data)
+
+    # Monta o dicionário de argumentos para o AgentConfig
+    kwargs: Dict[str, Any] = dict(
+        name=y.get("name", "Client"),
+        colorset=y.get("colorset", 3),
+        render_settings=rs,
+        engine_reward=er,
+        shaping=sh,
+        policy=pol,
+        model_dir=y.get("model_dir", "models"),
+        model_name=y.get("model_name", "agent.zip"),
+        train=bool(y.get("train", False)),
+        train_steps=int(y.get("train_steps", 300_000)),
+        # stack_frames=... REMOVIDO: AgentConfig original não suporta isso.
+        # O trainer usará o valor default da CLI (--stack).
+    )
+
+    # Campos opcionais (compatibilidade)
+    if _agentconfig_supports("weapon") and "weapon" in y:
+        kwargs["weapon"] = str(y.get("weapon", ""))
+    if _agentconfig_supports("lock_weapon") and "lock_weapon" in y:
+        kwargs["lock_weapon"] = bool(y.get("lock_weapon", False))
+
+    return AgentConfig(**kwargs)
+
 
 # ----------------------------------------------------------------------
 # CLI
@@ -92,7 +105,11 @@ def parse_args() -> argparse.Namespace:
         help="WAD/PK3 extra (nome em framework/maps/ ou caminho completo).",
     )
     
-    parser.add_argument("--game-config", default=None, help="Caminho do .cfg do jogo (tag.cfg)")
+    parser.add_argument(
+        "--game-config", 
+        default=None, 
+        help="Caminho do arquivo .cfg do jogo (ex: tag.cfg)"
+    )
 
     # Match settings
     parser.add_argument("--timelimit", type=float, default=0.0)
@@ -110,42 +127,45 @@ def parse_args() -> argparse.Namespace:
 # ----------------------------------------------------------------------
 # Env creation
 # ----------------------------------------------------------------------
-def make_env(args):
-    # Carrega configurações do agente
-    agent_cfg = load_agent_cfg_light(args.cfg)
-    
-    # Lógica de renderização (Host vê, clientes não)
-    render_mode = False
-    if args.render:
-        if args.is_host:
-            render_mode = True
-    
-    # Cria o objeto de configuração do Deathmatch
+def make_env(args: argparse.Namespace) -> DoomDMEnv:
+    try:
+        agent_cfg = load_agent_cfg_light(args.cfg)
+    except TypeError as e:
+        print(f"[ACTOR][FATAL] Erro ao instanciar AgentConfig: {e}")
+        print("[ACTOR] DICA: Verifique se o vizdm_comp/framework/config.py mudou.")
+        raise e
+
+    print(
+        f"[ACTOR] Agente: {agent_cfg.name} | "
+        f"Map: {args.map} | WAD: {args.wad} | Config: {args.game_config} | "
+        f"Render: {bool(args.render)} | Host: {bool(args.is_host)}",
+        flush=True,
+    )
+
     dm_cfg = DMConfig(
-        config_file=args.game_config,
+        total_players=args.players,
+        port=args.port,
+        join_ip=args.join_ip,
+        map_name=str(args.map),
         wad=args.wad,
-        map_name=args.map,
-        timelimit_minutes=args.timelimit if args.timelimit > 0 else 3.0,
-        render=render_mode,
-        total_players=args.players
+        config_file=args.game_config,
+        timelimit_minutes=float(args.timelimit),
+        render=bool(args.render),
     )
 
-
-    # --- A CORREÇÃO ESTÁ AQUI ---
-    # Agora passamos os 4 argumentos que o env.py exige, com os nomes certos.
+    print(f"[ACTOR] Criando DoomDMEnv (is_host={args.is_host})...", flush=True)
     env = DoomDMEnv(
-        name=agent_cfg.name,      # O nome vem do YAML do agente
-        is_host=args.is_host,     # Se sou host ou cliente
-        dm=dm_cfg,                # O env.py espera 'dm', não 'dm_config'
-        agent_config=agent_cfg    # O env.py espera 'agent_config'
+        name=agent_cfg.name,
+        is_host=bool(args.is_host),
+        dm=dm_cfg,
+        agent_config=agent_cfg,
     )
-    # ----------------------------
-    
+    print("[ACTOR] DoomDMEnv criado.", flush=True)
     return env
 
 
 # ----------------------------------------------------------------------
-# Step/reset handlers (always return dict; never raise)
+# Step/reset handlers
 # ----------------------------------------------------------------------
 def handle_reset(env: DoomDMEnv) -> Dict[str, Any]:
     try:
@@ -172,21 +192,9 @@ def handle_step(env: DoomDMEnv, action: int) -> Dict[str, Any]:
 
 
 # ----------------------------------------------------------------------
-# Shared-memory writer for observations (optional)
+# Shared-memory writer
 # ----------------------------------------------------------------------
 class ShmObsWriter:
-    """
-    Writer para observações via multiprocessing.shared_memory.
-
-    Trainer cria o SHM e manda:
-      cmd=set_shm_obs, shm_name=<nome>, shape=[...], dtype="uint8"
-    (Compat: aceita também "name" no lugar de "shm_name".)
-
-    Quando habilitado, o ator:
-      - escreve obs no buffer
-      - retorna via IPC só reward/done/info + obs_seq
-    """
-
     def __init__(self) -> None:
         self._shm: Optional[shared_memory.SharedMemory] = None
         self._view: Optional[np.ndarray] = None
@@ -202,7 +210,11 @@ class ShmObsWriter:
 
     def attach(self, shm_name: str, shape: Tuple[int, ...], dtype: np.dtype) -> None:
         self.close()
-        shm = shared_memory.SharedMemory(name=shm_name, create=False)
+        try:
+            shm = shared_memory.SharedMemory(name=shm_name, create=False)
+        except FileNotFoundError:
+             raise ValueError(f"Memória Compartilhada não encontrada: {shm_name}")
+             
         view = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
 
         if view.nbytes > shm.size:
@@ -214,23 +226,15 @@ class ShmObsWriter:
         self._obs_seq = 0
 
     def _write_compatible(self, obs: Any) -> None:
-        """
-        Escreve sem copiar quando possível, tolerando casos comuns de shape:
-          - obs (H,W,1) -> shm (H,W)
-          - obs (H,W,1) -> shm (1,H,W)
-        """
         assert self._view is not None
-
         arr = np.asarray(obs)
 
-        # Exato
         if arr.shape == self._view.shape:
             if arr.dtype != self._view.dtype:
                 arr = arr.astype(self._view.dtype, copy=False)
             self._view[...] = arr
             return
 
-        # (H,W,1) -> (H,W)
         if arr.ndim == 3 and arr.shape[-1] == 1 and self._view.ndim == 2:
             h, w, _ = arr.shape
             if self._view.shape == (h, w):
@@ -240,11 +244,10 @@ class ShmObsWriter:
                 self._view[...] = src
                 return
 
-        # (H,W,1) -> (1,H,W)
         if arr.ndim == 3 and arr.shape[-1] == 1 and self._view.ndim == 3 and self._view.shape[0] == 1:
             h, w, _ = arr.shape
             if self._view.shape == (1, h, w):
-                src = np.transpose(arr, (2, 0, 1))  # view na maioria dos casos
+                src = np.transpose(arr, (2, 0, 1)) 
                 if src.dtype != self._view.dtype:
                     src = src.astype(self._view.dtype, copy=False)
                 self._view[...] = src
@@ -294,10 +297,6 @@ def actor_loop(env: DoomDMEnv, conn: Connection) -> None:
                 conn.send({"obs_space": env.observation_space, "action_space": env.action_space})
 
             elif cmd == "set_shm_obs":
-                # Esperado:
-                #   {cmd, shm_name=<str>, shape=[...], dtype="uint8"}
-                # Compat:
-                #   aceita também "name" no lugar de "shm_name"
                 try:
                     shm_name = msg.get("shm_name") or msg.get("name")
                     if not shm_name:
@@ -309,7 +308,6 @@ def actor_loop(env: DoomDMEnv, conn: Connection) -> None:
                     shm_writer.attach(shm_name=str(shm_name), shape=shape, dtype=dtype)
                     conn.send({"ok": True})
                 except Exception as e:
-                    # Não derruba o ator; apenas desabilita SHM e segue com IPC normal.
                     print(f"[ACTOR][ERROR] set_shm_obs: {e!r}", flush=True)
                     try:
                         shm_writer.close()
@@ -337,7 +335,7 @@ def actor_loop(env: DoomDMEnv, conn: Connection) -> None:
 
             elif cmd == "step":
                 step_count += 1
-                if step_count % 10000 == 0:
+                if step_count % 5000 == 0:
                     print(f"[ACTOR] Steps: {step_count}", flush=True)
 
                 result = handle_step(env, int(msg.get("action", 0)))
@@ -367,36 +365,24 @@ def actor_loop(env: DoomDMEnv, conn: Connection) -> None:
                     conn.send(result)
 
             elif cmd == "close":
-                try:
-                    env.close()
-                except Exception:
-                    pass
-                try:
-                    shm_writer.close()
-                except Exception:
-                    pass
-                try:
-                    conn.send({"ok": True})
-                except Exception:
-                    pass
+                try: env.close() 
+                except: pass
+                try: shm_writer.close()
+                except: pass
+                try: conn.send({"ok": True})
+                except: pass
                 break
 
             else:
                 conn.send({"error": f"cmd inválido: {cmd!r}"})
 
     finally:
-        try:
-            env.close()
-        except Exception:
-            pass
-        try:
-            shm_writer.close()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: env.close()
+        except: pass
+        try: shm_writer.close()
+        except: pass
+        try: conn.close()
+        except: pass
         print("[ACTOR] Encerrado.", flush=True)
 
 
@@ -413,21 +399,23 @@ def main() -> None:
         try:
             conn = Client(address, authkey=args.auth_key.encode("utf-8"))
             break
-        except ConnectionRefusedError:
+        except (ConnectionRefusedError, OSError):
             time.sleep(1.0)
 
     if conn is None:
-        raise RuntimeError("Falha ao conectar no Treinador.")
+        print("[ACTOR] FALHA CRÍTICA: Timeout conectando ao Treinador.", flush=True)
+        sys.exit(1)
 
     print("[ACTOR] Conectado (TCP). Carregando VizDoom...", flush=True)
     try:
         env = make_env(args)
     except Exception as e:
+        print(f"[ACTOR] Erro ao criar ENV: {e}", flush=True)
         try:
             conn.send({"error": str(e)})
         except Exception:
             pass
-        raise
+        sys.exit(1)
 
     actor_loop(env, conn)
 

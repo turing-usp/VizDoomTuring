@@ -1,0 +1,1 @@
+python run_train.py --cfg example_agent.yaml --num-matches 3 --actors-per-match 15 --port 5029 --timelimit 0 --render host --map map02 --shm-obs

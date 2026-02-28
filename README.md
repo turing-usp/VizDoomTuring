@@ -18,4 +18,3 @@ Framework para treino e teste de agentes no [VizDoom](https://vizdoom.cs.put.edu
 3. Execute o Launcher:
    ```bash
    python Launcher.py
-   ``

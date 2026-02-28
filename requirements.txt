@@ -1,8 +1,0 @@
-vizdoom
-gymnasium
-stable-baselines3[extra]
-torch
-numpy
-pyyaml
-opencv-python
-customtkinter

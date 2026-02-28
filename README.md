@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="banner.png" alt="banner" width="800"/>
+  <img src="/utils/banner.png" alt="banner" width="800"/>
 </p>
 
 # VizDoomTuring

@@ -18,7 +18,7 @@ Uma vez que você clonou o repositório, podemos fazer os preparativos para exec
 
 2. E em seguida instale as dependências:
    ```bash
-   pip install -r requirements.txt
+   pip install -r ./utils/requirements.txt
    ```
 
 ## Treinando o Modelo

@@ -58,6 +58,10 @@ Além disto, os parâmetros adicionais podem ser inseridos juntos:
 | `--stack` | Quantidade de frames processados por vez. |
 | `--timelimit` | Tempo máximo de cada partida em minutos. |
 
+## Treinamento via Cloud
+
+Esse repositório também contém um script para realizar o treinamento via cloud. Para isso, abra o arquivo **TreinoColab.ipynb** no Google Colaboratory ou software de sua preferência e siga as instruções contidas nele.
+
 ## Assistindo o Agente
 
 Se quiser apenas assistir como o seu agente se comporta, você pode usar o arquivo **Launcher.py** para fazê-lo de forma mais intuitiva. Considere:

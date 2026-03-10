@@ -10,7 +10,7 @@ import os
 from .config import DMConfig, AgentConfig
 from .rewards import RewardShaper, apply_engine_rewards
 
-# --- LISTAS DE AÇÕES GLOBAIS ---
+# --- LISTAS DE AÇÕES ---
 actions_deathmatch = np.asarray([
     [0,0,0,0,0,0], [0,0,1,0,0,0], [0,0,0,1,0,0], [0,0,0,0,1,0],
     [0,0,1,0,0,1], [1,0,0,0,0,0], [0,1,0,0,0,0], [0,0,0,0,0,1]
@@ -21,24 +21,14 @@ buttons_deathmatch = [
 ]
 
 buttons_tag = [
-    Button.MOVE_FORWARD,
-    Button.MOVE_BACKWARD,
-    Button.TURN_LEFT, 
-    Button.TURN_RIGHT,
-    Button.SPEED,
-    Button.ATTACK 
+    Button.MOVE_FORWARD, Button.MOVE_BACKWARD,
+    Button.TURN_LEFT, Button.TURN_RIGHT,
+    Button.SPEED, Button.ATTACK 
 ]
 actions_tag = np.asarray([
-    [0,0,0,0,0,0], 
-    [1,0,0,0,0,0], 
-    [1,0,0,0,1,0], 
-    [0,1,0,0,0,0], 
-    [0,0,1,0,0,0], 
-    [0,0,0,1,0,0], 
-    [1,0,0,0,0,1], 
-    [1,0,0,0,1,1]  
+    [0,0,0,0,0,0], [1,0,0,0,0,0], [1,0,0,0,1,0], [0,1,0,0,0,0], 
+    [0,0,1,0,0,0], [0,0,0,1,0,0], [1,0,0,0,0,1], [1,0,0,0,1,1]  
 ], dtype=np.int32)
-
 
 class DoomDMEnv(gym.Env):
     metadata = {"render_modes": ["human"]}
@@ -52,11 +42,7 @@ class DoomDMEnv(gym.Env):
         
         g = self.game = vzd.DoomGame()
         
-        # --- MUDANÇA CRUCIAL: NÃO CARREGAMOS MAIS O CONFIG (tag.cfg) ---
-        # g.load_config(dm.config_file)  <-- REMOVIDO PARA EVITAR DEADLOCK
-        # ---------------------------------------------------------------
-        
-        # Configuração Manual do WAD (Agora única fonte da verdade)
+        # Configuração de WAD
         if self.dm.wad:
             root_dir = os.getcwd()
             wad_candidate_root = os.path.join(root_dir, self.dm.wad)
@@ -64,38 +50,36 @@ class DoomDMEnv(gym.Env):
             wad_candidate_fw = os.path.join(framework_dir, os.path.basename(self.dm.wad))
 
             if os.path.exists(wad_candidate_root):
-                # Força ser o IWAD (Jogo Base) para evitar carregar freedoom2.wad junto
                 g.set_doom_game_path(wad_candidate_root)
             elif os.path.exists(wad_candidate_fw):
                 g.set_doom_game_path(wad_candidate_fw)
             else:
-                print(f"[ENV] AVISO: WAD {self.dm.wad} não encontrado, VizDoom tentará padrão.")
+                print(f"[ENV] AVISO: WAD {self.dm.wad} não encontrado.")
 
         g.set_doom_map(self.dm.map_name)
+        # --- CONFIGURAÇÃO VISUAL (160x120, GRAY8) ---
         g.set_screen_resolution(vzd.ScreenResolution.RES_160X120)
-        g.set_screen_format(vzd.ScreenFormat.GRAY8)
+        g.set_screen_format(vzd.ScreenFormat.RGB24)
         g.set_render_hud(False)
         g.set_render_crosshair(False)
         g.set_window_visible(self.dm.render)
 
-        # Detecta modo de jogo pelo nome do arquivo (string), sem abrir o arquivo
+        # Detecta modo
         config_filename = str(dm.config_file).lower()
-
         if "tag" in config_filename:
             self.game_mode = "tag"
             available_buttons = buttons_tag
             self._actions = actions_tag
-            print(f"--- MODO 'PEGA-PEGA' (TAG) CARREGADO PARA {name} ---")
-            g.set_render_weapon(False)
+            g.set_render_weapon(False) 
         else:
             self.game_mode = "deathmatch"
             available_buttons = buttons_deathmatch
             self._actions = actions_deathmatch
-            print(f"--- MODO 'DEATHMATCH' (PADRÃO) CARREGADO PARA {name} ---")
             g.set_render_weapon(True)
             
         g.set_available_buttons(available_buttons)
 
+        # Variáveis do Jogo
         g.add_available_game_variable(GameVariable.HEALTH)
         g.add_available_game_variable(GameVariable.ARMOR)
         g.add_available_game_variable(GameVariable.AMMO2)
@@ -105,51 +89,70 @@ class DoomDMEnv(gym.Env):
         g.add_available_game_variable(GameVariable.HITS_TAKEN)
 
         apply_engine_rewards(g, self.agent.engine_reward)
-
         g.set_mode(Mode.ASYNC_PLAYER) 
 
-        # Adicionamos -nosound e -noconsole para garantir performance e evitar travar audio
+        # --- ARGS DO JOGO (COM PROTEÇÃO ANTI-ERRO) ---
         common = (
             f"-deathmatch +timelimit {self.dm.timelimit_minutes} "
             f"+sv_forcerespawn 1 +sv_noautoaim 1 +sv_respawnprotect 1 +sv_spawnfarthest 1 "
             f"-skill 3 +name {self.name} +colorset {self.agent.colorset} "
             f"-nosound -noconsole "
+            f"+sv_noitems 1 "     # Sem armas no chão
+            f"+give fist "        # Soco garantido
+            f"+sv_nointermission 1 " # Pula placar (Evita timeout de 600s)
         )
+
         if self.is_host:
             args = f"-host {self.dm.total_players} -port {self.dm.port} +viz_connect_timeout 60 "
         else:
             args = f"-join {self.dm.join_ip} -port {self.dm.port} "
         g.add_game_args(args + common)
         
-        print(f"[ENV DEBUG] Tentando iniciar VizDoom (g.init) para: {self.name} | Host={self.is_host}")
+        import time
+        if not self.is_host and self.dm.render:
+            # Faz o Joiner esperar 2 segundos para a janela do Host abrir primeiro
+            time.sleep(2.0) 
+        # ---------------------------------------
+
         try:
             g.init()
             print(f"[ENV DEBUG] VizDoom INICIADO com sucesso para: {self.name}")
         except Exception as e:
-            print(f"[ENV DEBUG] ERRO FATAL ao iniciar VizDoom para {self.name}: {e}")
+            print(f"[ENV CRASH] Erro ao iniciar VizDoom: {e}")
             raise e
 
         self.shaper = RewardShaper(self.agent.shaping)
         self._last_obs: Optional[np.ndarray] = None
 
+        # --- DEFINIÇÃO DO ESPAÇO DE OBSERVAÇÃO (H, W, 1) ---
+        # Isso garante compatibilidade com GRAY8
         H, W = self.dm.screen_h, self.dm.screen_w
-        self.observation_space = spaces.Box(low=0, high=255, shape=(H, W, 1), dtype=np.uint8)
+        self.observation_space = spaces.Box(low=0, high=255, shape=(120, 160, 3), dtype=np.uint8)
+        
         self.action_space = spaces.Discrete(len(self._actions))
 
     def _read_obs(self):
         state = self.game.get_state()
+        # Se vazio, retorna zeros no formato (H, W, 1)
         if state is None:
             return np.zeros(self.observation_space.shape, dtype=np.uint8)
 
-        buf = state.screen_buffer
+        buf = state.screen_buffer # VizDoom Gray8 devolve (H, W) puro
+        
+        # 1. Garante o Resize para 160x120 (H=120, W=160)
         target_w = self.dm.screen_w
         target_h = self.dm.screen_h
         
-        if buf.shape[0] != target_h or buf.shape[1] != target_w:
-             buf = cv2.resize(buf, (target_w, target_h), interpolation=cv2.INTER_AREA)
         
+        # 2. Garante CHANNEL LAST (H, W, 1)
+        # O buffer vem como (120, 160). Adicionamos a dimensão no fim.
         if buf.ndim == 2:
-            buf = buf[..., None]
+            buf = buf[..., np.newaxis] # Vira (120, 160, 1)
+            
+        # Caso bizarro de já ter canais (C, H, W) -> converte para (H, W, C)
+        elif buf.ndim == 3 and buf.shape[0] <= 3: 
+             buf = np.moveaxis(buf, 0, -1) 
+            
         return buf
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
@@ -158,11 +161,9 @@ class DoomDMEnv(gym.Env):
             try:
                 self.game.new_episode()
             except Exception:
-                import time
-                for _ in range(600):
-                    time.sleep(0.03)
-                    if self.game.is_running() and not self.game.is_episode_finished():
-                        break
+                # Fallback simples
+                pass
+        
         self.shaper.reset(self.game)
         obs = self._read_obs()
         return obs, {"name": self.name}
@@ -170,11 +171,13 @@ class DoomDMEnv(gym.Env):
     def step(self, action: int):
         if self.game.is_player_dead():
             self.game.respawn_player()
+
         a = self._actions[action].tolist()
         engine_r = float(self.game.make_action(a, self.dm.frame_skip))
         shaped_r = self.shaper.compute(self.game, engine_r)
         done = self.game.is_episode_finished()
         obs = self._read_obs()
+        
         return obs, shaped_r, done, False, {"engine_r": engine_r}
 
     def render(self): pass

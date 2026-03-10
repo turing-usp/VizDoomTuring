@@ -1,39 +1,42 @@
 name: "Fugitivo"
-colorset: 8 # (Cor Verde)
+colorset: 8 # Verde
 
 engine_reward:
-  # --- O OBJETIVO ---
-  # Recompensa pequena e constante por estar vivo
-  living_reward: 0.01 
+  # Ganha pontos a cada instante que sobrevive. 
+  # Isso ensina: "Fique longe de problemas".
+  living_reward: 0.02 
 
   # --- PENALIDADES ---
-  # Penalidade alta por ser "tocado" pelo pegador
+  # Penalidade alta ao ser tocado. O objetivo supremo é evitar isso.
   damage_taken_penalty: -10.0
-  # Penalidade por acidentalmente "tocar" no pegador (ex: dar um soco)
-  damage_made_reward: -1.0
-  frag_reward: -100.0
+  
+  # Penalidade por atacar: Isso "castra" o agente. 
+  # Ele aprende que socar o pegador é desperdício de energia ou perigoso.
+  damage_made_reward: -2.0 
+  
+  # Morrer é o pior cenário possível.
+  frag_reward: -50.0 # Reduzi um pouco, pois -100 as vezes gera medo excessivo de explorar
 
 shaping:
-  w_deaths: -100.0
-  # O step_penalty aqui é zero, pois já usamos o living_reward
-  step_penalty: 0.0
-  include_engine_reward: true # Usa as recompensas acima
+  w_deaths: -50.0
+  step_penalty: 0.0 # Fugitivo não tem pressa, ele quer que o tempo passe.
+  include_engine_reward: true
 
 policy:
   algo: "ppo"
   policy_kwargs:
-    # Reduzir a rede neural. Pega-Pega é simples, não precisa de 128 neurônios.
     net_arch:
-      pi: [64, 64] # Era [128, 64]
-      vf: [64, 64]
+      pi: [256, 256, 256] # Cérebro Profundo para a Política (Ação)
+      vf: [256, 256, 256] # Cérebro Profundo para o Valor (Estratégia)
   learn_kwargs:
-    n_steps: 128
-    batch_size: 64
-    
-    learning_rate: 3e-4
-    n_epochs: 3 # Quantas vezes ele repassa os dados. Menos epochs = treino mais rápido (mas talvez menos estável)
+    n_steps: 2048       # Planejamento de longo prazo (Padrão ouro do PPO)
+    batch_size: 256     # Otimização massiva em blocos grandes
+    learning_rate: 0.0001 # Passo de aprendizado menor para não "esquecer" o que aprendeu
+    n_epochs: 4         # Atualizações eficientes sem over-fitting
+    gamma: 0.995        # Foco brutal no futuro (O agente vai prever jogadas muito à frente)
+    ent_coef: 0.01      # Curiosidade estável para explorar sem parecer bêbado
 
 model_dir: "models"
 model_name: "fugitivo_bot.zip"
 train: true
-train_steps: 750000
+train_steps: 15000000 

@@ -1,0 +1,35 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # 1. Bibliotecas C++ e de Sistema (Mantidas iguais)
+    apt-get update && apt-get install -y \
+        build-essential zlib1g-dev libsdl2-dev libjpeg-dev \
+        nasm tar libbz2-dev libgtk2.0-dev cmake git libfluidsynth-dev \
+        libgme-dev libopenal-dev timidity libwildmidi-dev unzip \
+        wget python3-pip python3-dev python-is-python3 \
+        libgl1-mesa-glx libglib2.0-0
+
+    pip install --upgrade pip
+    
+    # 2. A GRANDE MUDANÇA: PyTorch com suporte a CUDA (GPU) nativo
+    # Removemos o --index-url. O pip agora baixa a versão com GPU.
+    pip install torch torchvision torchaudio
+    
+    # 3. Restante das bibliotecas
+    pip install vizdoom \
+                gymnasium \
+                stable-baselines3[extra] \
+                opencv-python-headless \
+                pyyaml \
+                numpy
+
+%environment
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+
+%labels
+    Author Rafael Romero
+    Description Container VizDoom otimizado para NVIDIA GPU em Cluster HPC

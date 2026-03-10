@@ -205,20 +205,25 @@ def auto_adjust_n_steps(agent_cfg: AgentConfig, env: VecEnv, max_rollout_gib: fl
     return agent_cfg
 
 def build_model(agent_cfg: AgentConfig, env: VecEnv, save_path: str) -> PPO:
-    if os.path.exists(save_path + ".zip"):
-        print(f"[TRAIN] Carregando modelo existente: {save_path}.zip")
-        model = PPO.load(save_path, env=env, print_system_info=True)
+    # --- CORREÇÃO DO BUG ".ZIP DUPLO" ---
+    # Se o caminho já tem .zip, usa ele. Se não, adiciona.
+    file_to_check = save_path if save_path.endswith(".zip") else f"{save_path}.zip"
+    
+    if os.path.exists(file_to_check):
+        print(f"[TRAIN] SUCESSO! Carregando modelo existente: {file_to_check}")
+        # Carrega usando o caminho exato
+        model = PPO.load(file_to_check, env=env, print_system_info=False)
     else:
         print(f"[TRAIN] Criando NOVO modelo PPO: {agent_cfg.model_name}")
         
         raw_args = get_policy_args(agent_cfg.policy)
         policy_kwargs = raw_args.copy() if raw_args else {}
         
-        # Pega os valores (agora n_steps virá certo como 128)
+        # Pega os valores
         learning_rate = float(policy_kwargs.pop("learning_rate", 1e-4))
-        n_steps = int(policy_kwargs.pop("n_steps", 128)) # Default safe aqui também
+        n_steps = int(policy_kwargs.pop("n_steps", 128))
         batch_size = int(policy_kwargs.pop("batch_size", 64))
-        n_epochs = int(policy_kwargs.pop("n_epochs", 3)) # Default 3 epochs
+        n_epochs = int(policy_kwargs.pop("n_epochs", 3))
         gamma = float(policy_kwargs.pop("gamma", 0.99))
         gae_lambda = float(policy_kwargs.pop("gae_lambda", 0.95))
         clip_range = float(policy_kwargs.pop("clip_range", 0.2))

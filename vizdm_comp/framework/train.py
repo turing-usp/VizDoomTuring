@@ -1,6 +1,9 @@
 from typing import Callable
 from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage, VecFrameStack
 from .policies import resolve_algo, build_sb3, ExternalPolicyAdapter
+import os
+
+
 
 def make_vec_env(env_fn: Callable, n_stack: int):
     env = DummyVecEnv([env_fn])
@@ -31,8 +34,19 @@ def train_or_play(env_fn: Callable, n_stack: int, agent_cfg, save_path: str):
         # sem return
     else:
         algo_cls = resolve_algo(algo_name)
-        model = build_sb3(algo_cls, "CnnPolicy", env,
-                          agent_cfg.policy.policy_kwargs, agent_cfg.policy.learn_kwargs)
+        
+        # --- A MÁGICA DO CARREGAMENTO AQUI ---
+        if os.path.exists(save_path):
+            print(f"[TRAIN] SUCESSO! Carregando cérebro existente: {save_path}")
+            # Carrega os pesos salvos e conecta ao ambiente atual
+            model = algo_cls.load(save_path, env=env)
+        else:
+            print(f"[TRAIN] Arquivo não encontrado. Criando NOVO modelo PPO: {save_path}")
+            # Só cria um zero bala se o arquivo não existir
+            model = build_sb3(algo_cls, "CnnPolicy", env,
+                              agent_cfg.policy.policy_kwargs, agent_cfg.policy.learn_kwargs)
+        # -------------------------------------
+
         if agent_cfg.train:
             remaining = int(agent_cfg.train_steps)
             chunk = max(10_000, remaining // 10)
@@ -48,7 +62,7 @@ def train_or_play(env_fn: Callable, n_stack: int, agent_cfg, save_path: str):
                 obs, _rew, dones, _infos = env.step(action)
                 if dones[0]:
                     obs = env.reset()
-        model.save(save_path)
+            model.save(save_path)
 
 #ALTERAÇÃO que deve ser feita dps de ter os modelos carregados
 # else:

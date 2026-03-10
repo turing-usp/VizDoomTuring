@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
+from stable_baselines3.common.vec_env import VecTransposeImage, VecFrameStack
 import argparse
 import collections
 import os
@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from multiprocessing.connection import Listener, Connection
 from typing import Any, Dict, List, Tuple, Optional
 
-from gymnasium import spaces
-from stable_baselines3.common.vec_env import VecEnv, VecTransposeImage, VecFrameStack
 
 # Importações locais
 from .client import load_agent_cfg
@@ -59,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auth-key", default="vizdoom_dm")
     parser.add_argument("--chunk-steps", type=int, default=50_000)
     parser.add_argument("--map", default="map01")
-    parser.add_argument("--wad", default=None)
+    parser.add_argument("--wad", type=str, default="doom2.wad", help="WAD file")
     return parser.parse_args()
 
 # ======================================================================
@@ -215,7 +213,7 @@ def train_chunk_threaded(rt: GroupRuntime, steps: int):
             total_timesteps=steps,
             reset_num_timesteps=False,
             callback=rt.callback,
-            progress_bar=True,
+            progress_bar=False,
         )
         rt.model.save(rt.save_path)
     except Exception as e:
@@ -302,3 +300,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # --- A VACINA ANTI-DEADLOCK DO LINUX ---
+    import multiprocessing as mp
+    try:
+        mp.set_start_method('spawn', force=True)
+        print("[INIT] Forçando multiprocessing para 'spawn' (Compatibilidade Linux/C++)")
+    except RuntimeError:
+        pass

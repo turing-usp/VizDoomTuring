@@ -10,6 +10,10 @@ import os
 from .config import DMConfig, AgentConfig
 from .rewards import RewardShaper, apply_engine_rewards
 
+import cv2
+import numpy as np
+
+
 # --- LISTAS DE AÇÕES ---
 actions_deathmatch = np.asarray([
     [0,0,0,0,0,0], [0,0,1,0,0,0], [0,0,0,1,0,0], [0,0,0,0,1,0],
@@ -124,12 +128,19 @@ class DoomDMEnv(gym.Env):
         self.shaper = RewardShaper(self.agent.shaping)
         self._last_obs: Optional[np.ndarray] = None
 
-        # --- DEFINIÇÃO DO ESPAÇO DE OBSERVAÇÃO (H, W, 1) ---
-        # Isso garante compatibilidade com GRAY8
-        H, W = self.dm.screen_h, self.dm.screen_w
+        # --- DEFINIÇÃO DO ESPAÇO DE OBSERVAÇÃO ---
         self.observation_space = spaces.Box(low=0, high=255, shape=(120, 160, 3), dtype=np.uint8)
-        
         self.action_space = spaces.Discrete(len(self._actions))
+
+        # =================================================================
+        # [CÂMERA DE SEGURANÇA] -> AGORA SIM NO FINAL DO __INIT__!
+        # =================================================================
+        self.gravando_video = False
+        if self.is_host and "pegador" in self.name.lower():
+            self.gravando_video = True
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            self.video_out = cv2.VideoWriter('partida_vizdoom.avi', fourcc, 35.0, (640, 480))
+            print("[VIDEO] Câmera ativada na visão do Pegador!")
 
     def _read_obs(self):
         state = self.game.get_state()
@@ -177,10 +188,24 @@ class DoomDMEnv(gym.Env):
         shaped_r = self.shaper.compute(self.game, engine_r)
         done = self.game.is_episode_finished()
         obs = self._read_obs()
+
+        state = self.game.get_state()
+        
+        # [CÂMERA DE SEGURANÇA]
+        if self.gravando_video and state is not None:
+            img = state.screen_buffer 
+            # O RGB24 já entrega (120, 160, 3), então só invertemos as cores para o OpenCV (BGR)
+            frame_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            # Dá o zoom e salva
+            frame_zoom = cv2.resize(frame_bgr, (640, 480), interpolation=cv2.INTER_NEAREST)
+            self.video_out.write(frame_zoom)
         
         return obs, shaped_r, done, False, {"engine_r": engine_r}
 
     def render(self): pass
     def close(self):
+        if self.gravando_video:
+            self.video_out.release()
+            print("[VIDEO] Arquivo 'partida_vizdoom.avi' salvo e finalizado!")
         try: self.game.close()
         except: pass

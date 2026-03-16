@@ -34,9 +34,9 @@ policy:
     learning_rate: 0.0001 # Passo de aprendizado menor para não "esquecer" o que aprendeu
     n_epochs: 4         # Atualizações eficientes sem over-fitting
     gamma: 0.995        # Foco brutal no futuro (O agente vai prever jogadas muito à frente)
-    ent_coef: 0.01      # Curiosidade estável para explorar sem parecer bêbado
+    ent_coef: 0.05      # Curiosidade estável para explorar sem parecer bêbado
 
 model_dir: "models"
 model_name: "fugitivo_bot.zip"
-train: true
+train: true 
 train_steps: 15000000 

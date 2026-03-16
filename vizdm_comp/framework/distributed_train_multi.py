@@ -6,7 +6,6 @@ import collections
 import os
 import subprocess
 import sys
-import time
 import threading  # <--- A SOLUÇÃO MÁGICA
 from dataclasses import dataclass
 from multiprocessing.connection import Listener, Connection
@@ -105,8 +104,7 @@ def launch_multi_model_actors(args, agent_specs):
         host_spec = agent_specs[0]
         host_cmd = _build_actor_cmd_single(host_spec.cfg_path, players_per_match, args.game_ip, match_port, args.timelimit, args.trainer_host, args.trainer_port, args.auth_key, True, render_mode, args.map, args.wad, args.game_config)
         procs.append(subprocess.Popen(host_cmd))
-        print("[MM-TRAIN] Host lançado. Aguardando 6 segundos...")
-        time.sleep(6.0)
+        print("[MM-TRAIN] Host lançado.")
 
         # CLIENTES
         for spec_idx, spec in enumerate(agent_specs):
@@ -117,11 +115,7 @@ def launch_multi_model_actors(args, agent_specs):
             for _ in range(remaining):
                 cmd = _build_actor_cmd_single(spec.cfg_path, players_per_match, args.game_ip, match_port, args.timelimit, args.trainer_host, args.trainer_port, args.auth_key, False, render_mode, args.map, args.wad, args.game_config)
                 procs.append(subprocess.Popen(cmd))
-                time.sleep(1.0) 
 
-        if match_idx < args.num_matches - 1:
-            print("[MM-TRAIN] >>> PAUSA DE SEGURANÇA: 10s... <<<")
-            time.sleep(10.0) 
     return procs
 
 def accept_actor_conns(listener, num_actors):
@@ -209,15 +203,27 @@ def build_group_runtimes(agent_specs, conns, stack):
 def train_chunk_threaded(rt: GroupRuntime, steps: int):
     """Função executada em thread separada para cada modelo."""
     try:
+        # Define se estamos em modo de Guerra ou de Cinema
+        modo = "TREINO" if rt.agent_cfg.train else "ESPECTADOR"
+        print(f"\n[{modo}] Iniciando {steps} passos para {rt.spec.cfg_path}...")
+        
+        # Deixamos o motor nativo do PyTorch jogar. Ele é imune a deadlocks!
         rt.model.learn(
             total_timesteps=steps,
             reset_num_timesteps=False,
             callback=rt.callback,
             progress_bar=False,
         )
-        rt.model.save(rt.save_path)
+        
+        # A MÁGICA DA SEGURANÇA: Só salva o .zip se o YAML mandar treinar!
+        if rt.agent_cfg.train:
+            rt.model.save(rt.save_path)
+            print(f"[{modo}] Treino concluído e arquivo .zip atualizado com sucesso!")
+        else:
+            print(f"[{modo}] Gravação concluída! Os seus modelos de 5M estão intocados.")
+
     except Exception as e:
-        print(f"[THREAD-ERROR] Falha no treino de {rt.spec.cfg_path}: {e}")
+        print(f"[THREAD-ERROR] Falha em {rt.spec.cfg_path}: {e}")
 
 def train_multi_models(groups: List[GroupRuntime], chunk_steps: int):
     if not groups: return
@@ -274,7 +280,7 @@ def main():
     print(f"[MM-TRAIN] {args.num_matches} partidas, {total_actors} atores total.")
     listener, _ = start_listener(args, backlog=total_actors)
 
-    actors = []
+    actors = [] 
     conns = []
     try:
         actors = launch_multi_model_actors(args, agent_specs)

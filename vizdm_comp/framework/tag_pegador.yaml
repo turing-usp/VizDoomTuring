@@ -17,7 +17,6 @@ engine_reward:
 
 shaping:
   w_deaths: -10.0 # Se ele morrer (cair na lava/ácido), penalidade pequena.
-  
   # --- A MUDANÇA MAIS IMPORTANTE ---
   # Penalidade por tempo. "Corra, você está perdendo pontos!"
   step_penalty: -0.01 
@@ -35,7 +34,7 @@ policy:
     learning_rate: 0.0001 # Passo de aprendizado menor para não "esquecer" o que aprendeu
     n_epochs: 4         # Atualizações eficientes sem over-fitting
     gamma: 0.995        # Foco brutal no futuro (O agente vai prever jogadas muito à frente)
-    ent_coef: 0.01      # Curiosidade estável para explorar sem parecer bêbado
+    ent_coef: 0.05      # Curiosidade estável para explorar sem parecer bêbado
 
 model_dir: "models"
 model_name: "pegador_bot.zip"

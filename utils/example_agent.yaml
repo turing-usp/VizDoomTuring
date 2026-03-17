@@ -1,4 +1,4 @@
-name: "Alice"
+name: "Joel"
 colorset: 2
 stack_frames: 4
 
@@ -8,7 +8,7 @@ stack_frames: 4
 
 # --- CONFIGURAÇÕES VISUAIS ---
 render_settings:
-  resolution: "RES_120X90"
+  resolution: "RES_160X120"
   format: "GRAY8"
   hud: true
 
@@ -33,7 +33,7 @@ reward:
     w_hits: 0.0
     w_hits_taken: 0.0
     w_deaths: 0.0
-    step_penalty: -0.0001
+    step_penalty: -0.005
     include_engine_reward: true  # still ignored by RewardShaper, OK
 
 policy:
@@ -41,19 +41,19 @@ policy:
   extractor: "cnn_default"
   policy_kwargs:
     net_arch:
-      pi: [256, 512, 512]
-      vf: [512, 512, 256]
+      pi: [128, 128]
+      vf: [128, 128]
 
   learn_kwargs:
     n_steps: 256
-    batch_size: 3072
+    batch_size: 64
     n_epochs: 4
-    learning_rate_max: 6e-4
-    learning_rate_min: 1e-7
+    learning_rate_max: 3e-4
+    learning_rate_min: 1e-5
     gamma: 0.99
-    ent_coef: 0.05
+    ent_coef: 0.01
 
 model_dir: "models"
-model_name: "alice_shared_ppo.zip"
+model_name: "modelojoel"
 train: true
-train_steps: 6000000
+train_steps: 500000

@@ -10,6 +10,7 @@ VAR_LIST = [
     vzd.GameVariable.HEALTH,
     vzd.GameVariable.ARMOR,
     vzd.GameVariable.AMMO2,
+    vzd.GameVariable.DAMAGECOUNT,
     vzd.GameVariable.DEATHCOUNT,
     vzd.GameVariable.HITCOUNT,
     vzd.GameVariable.HITS_TAKEN,
@@ -72,6 +73,7 @@ class RewardShaper:
         d_health = d[int(vzd.GameVariable.HEALTH)]
         d_armor = d[int(vzd.GameVariable.ARMOR)]
         d_ammo2 = d[int(vzd.GameVariable.AMMO2)]
+        d_damage_made = d[int(vzd.GameVariable.DAMAGECOUNT)]
         d_deaths = d[int(vzd.GameVariable.DEATHCOUNT)]
         d_hits = d[int(vzd.GameVariable.HITCOUNT)]
         d_hits_taken = d[int(vzd.GameVariable.HITS_TAKEN)]
@@ -88,6 +90,9 @@ class RewardShaper:
         # AMMO2 (custo só quando diminui; sinal controlado por w_ammo2_cost)
         if d_ammo2 < 0:
             r += self.cfg.w_ammo2_cost * (-d_ammo2)
+
+        # DAMAGE DONE
+        r += _term(d_damage_made, self.cfg.w_damage_made)
 
         # HITS
         r += _term(d_hits, self.cfg.w_hits)

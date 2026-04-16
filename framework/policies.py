@@ -104,6 +104,8 @@ def _coerce_learn_kwargs(learn_kwargs: Dict[str, Any]) -> Dict[str, Any]:
         "learning_rate",
         "learning_rate_max",
         "learning_rate_min",
+        "ent_coef_max",
+        "ent_coef_min",
         "gamma",
         "gae_lambda",
         "ent_coef",
@@ -165,10 +167,14 @@ def build_sb3(
     # extrai range de LR, se houver
     lr_max = learn_kwargs.pop("learning_rate_max", None)
     lr_min = learn_kwargs.pop("learning_rate_min", None)
+    ent_max = learn_kwargs.pop("ent_coef_max", None)
+    ent_min = learn_kwargs.pop("ent_coef_min", None)
 
     # se não há learning_rate explícito e temos lr_max, usamos ele como base
     if "learning_rate" not in learn_kwargs and lr_max is not None:
         learn_kwargs["learning_rate"] = lr_max
+    if "ent_coef" not in learn_kwargs and ent_max is not None:
+        learn_kwargs["ent_coef"] = ent_max
 
     # escolhe device explicitamente
     use_cuda = torch.cuda.is_available()
@@ -196,6 +202,16 @@ def build_sb3(
             print(f"[POLICY][WARN] Não foi possível setar _lr_range: {e}")
 
     # sanity-check rápido
+    if ent_max is not None and ent_min is not None:
+        try:
+            model._ent_coef_range = (float(ent_max), float(ent_min))
+            print(
+                f"[POLICY] Entropy range configurado em model._ent_coef_range = "
+                f"({float(ent_max)}, {float(ent_min)})"
+            )
+        except Exception as e:
+            print(f"[POLICY][WARN] NÃ£o foi possÃ­vel setar _ent_coef_range: {e}")
+
     print(f"[POLICY] SB3 model.device = {getattr(model, 'device', 'unknown')}")
 
     return model

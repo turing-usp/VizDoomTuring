@@ -12,6 +12,11 @@ class DMConfig:
     port: int = 5029
     join_ip: str = "127.0.0.1"
 
+    # Scenario control
+    # - .cfg scenario file inside framework/maps or a full path
+    # - OR a .wad/.pk3 to use as the base scenario path
+    scenario: Optional[str] = None
+
     # Map control
     map_name: str = "map01"
     # Optional extra content file:
@@ -21,8 +26,10 @@ class DMConfig:
 
     timelimit_minutes: float = 3.0
     render: bool = False
+    render_agent_view: bool = False
 
     frame_skip: int = 8
+    ticrate: int = 30
     screen_w: int = 160
     screen_h: int = 120
     stack_frames: int = 4
@@ -56,9 +63,13 @@ class ShapingConfig:
     w_armor: float = 0.0
     w_ammo2_cost: float = 0.0
     w_hits: float = 0.0
+    w_damage_made: float = 0.0
     w_hits_taken: float = 0.0
     w_deaths: float = 0.0
     step_penalty: float = 0.0
+    wall_stuck_penalty: float = 0.0
+    wall_stuck_min_move: float = 1.0
+    wall_stuck_max_turn_deg: float = 5.0
     include_engine_reward: bool = False
 
 

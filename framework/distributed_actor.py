@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import time
+import traceback
 from multiprocessing import shared_memory
 from multiprocessing.connection import Client, Connection
 from typing import Any, Dict, Optional, Tuple
@@ -87,15 +88,19 @@ def parse_args() -> argparse.Namespace:
 
     # Map/WAD switching
     parser.add_argument("--map", default="map01", help="Nome do mapa (ex.: MAP01, map01).")
+    parser.add_argument("--scenario", default=None, help="Cenário base .cfg/.wad/.pk3.")
     parser.add_argument(
         "--wad",
         default=None,
         help="WAD/PK3 extra (nome em framework/maps/ ou caminho completo).",
     )
+    parser.add_argument("--frame-skip", type=int, default=8)
+    parser.add_argument("--ticrate", type=int, default=30)
 
     # Match settings
     parser.add_argument("--timelimit", type=float, default=0.0)
     parser.add_argument("--render", action="store_true")
+    parser.add_argument("--render-agent-view", action="store_true")
     parser.add_argument("--is-host", action="store_true")
 
     # IPC (trainer<->actor)
@@ -115,8 +120,10 @@ def make_env(args: argparse.Namespace) -> DoomDMEnv:
     print(
         f"[ACTOR] Agente: {agent_cfg.name} | "
         f"Resolução YAML: {agent_cfg.render_settings.resolution} | "
-        f"Map: {args.map} | WAD: {args.wad} | "
-        f"Render: {bool(args.render)} | Host: {bool(args.is_host)}",
+        f"Scenario: {args.scenario} | Map: {args.map} | WAD: {args.wad} | "
+        f"frame_skip: {args.frame_skip} | ticrate: {args.ticrate} | "
+        f"Render: {bool(args.render)} | RenderAgentView: {bool(args.render_agent_view)} | "
+        f"Host: {bool(args.is_host)}",
         flush=True,
     )
 
@@ -124,10 +131,14 @@ def make_env(args: argparse.Namespace) -> DoomDMEnv:
         total_players=args.players,
         port=args.port,
         join_ip=args.join_ip,
+        scenario=args.scenario,
         map_name=str(args.map),
         wad=args.wad,
         timelimit_minutes=float(args.timelimit),
         render=bool(args.render),
+        render_agent_view=bool(args.render_agent_view),
+        frame_skip=int(args.frame_skip),
+        ticrate=int(args.ticrate),
     )
 
     print(f"[ACTOR] Criando DoomDMEnv (is_host={args.is_host})...", flush=True)
@@ -402,6 +413,14 @@ def actor_loop(env: DoomDMEnv, conn: Connection) -> None:
 # ----------------------------------------------------------------------
 def main() -> None:
     args = parse_args()
+    try:
+        print("[ACTOR] Carregando VizDoom antes de conectar ao trainer...", flush=True)
+        env = make_env(args)
+    except Exception as e:
+        print(f"[ACTOR][FATAL] Falha ao criar env: {e!r}", flush=True)
+        traceback.print_exc()
+        raise
+
     address = (args.trainer_host, args.trainer_port)
     print(f"[ACTOR] Conectando em {address}...", flush=True)
 
@@ -414,17 +433,13 @@ def main() -> None:
             time.sleep(1.0)
 
     if conn is None:
-        raise RuntimeError("Falha ao conectar no Treinador.")
-
-    print("[ACTOR] Conectado (TCP). Carregando VizDoom...", flush=True)
-    try:
-        env = make_env(args)
-    except Exception as e:
         try:
-            conn.send({"error": str(e)})
+            env.close()
         except Exception:
             pass
-        raise
+        raise RuntimeError("Falha ao conectar no Treinador.")
+
+    print("[ACTOR] Conectado (TCP). Entrando no loop.", flush=True)
 
     actor_loop(env, conn)
 

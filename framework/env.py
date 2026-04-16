@@ -32,6 +32,32 @@ class DoomDMEnv(gym.Env):
 
     metadata = {"render_modes": ["human"]}
 
+    @staticmethod
+    def _resolve_map_asset(path_or_name: Optional[str]) -> Optional[str]:
+        if not path_or_name:
+            return None
+
+        raw = str(path_or_name).strip()
+        if not raw:
+            return None
+
+        if os.path.isfile(raw):
+            return raw
+
+        maps_dir = os.path.join(os.path.dirname(__file__), "maps")
+        direct = os.path.join(maps_dir, raw)
+        if os.path.isfile(direct):
+            return direct
+
+        base, ext = os.path.splitext(raw)
+        if not ext:
+            for candidate_ext in (".cfg", ".wad", ".pk3"):
+                candidate = os.path.join(maps_dir, raw + candidate_ext)
+                if os.path.isfile(candidate):
+                    return candidate
+
+        return raw
+
     def __init__(self, name: str, is_host: bool, dm: DMConfig, agent: AgentConfig):
         super().__init__()
         self.name = name
@@ -47,6 +73,8 @@ class DoomDMEnv(gym.Env):
 
         self._timelimit_minutes: float = float(self.dm.timelimit_minutes)
         self._infinite_match: bool = self._timelimit_minutes <= 0.0
+        self._render_agent_view: bool = bool(getattr(self.dm, "render_agent_view", False))
+        self._agent_view_window_name: str = f"agent_view::{self.name}"
 
         print(
             f"[ENV] __init__() name={self.name}, is_host={self.is_host}, "
@@ -62,7 +90,17 @@ class DoomDMEnv(gym.Env):
         g = self.game = vzd.DoomGame()
 
         # cig.cfg precisa estar acessível (CWD) ou use caminho absoluto
-        g.load_config("cig.cfg")
+        scenario_path = self._resolve_map_asset(getattr(self.dm, "scenario", None))
+        if scenario_path and str(scenario_path).lower().endswith(".cfg"):
+            print(f"[ENV] Scenario CFG: {scenario_path}")
+            g.load_config(str(scenario_path))
+        else:
+            print("[ENV] Scenario CFG: cig.cfg")
+            g.load_config("cig.cfg")
+
+        if scenario_path and str(scenario_path).lower().endswith((".wad", ".pk3")):
+            print(f"[ENV] Scenario base WAD/PK3: {scenario_path}")
+            g.set_doom_scenario_path(str(scenario_path))
         g.set_doom_map(self.dm.map_name)
 
         # ------------------------------------------------------------------
@@ -110,23 +148,32 @@ class DoomDMEnv(gym.Env):
         net_res_enum = _get_res_enum(net_res_name)
 
         if bool(self.dm.render):
-            # Janela (debug): alta resolução
-            window_res_enum = _get_res_enum("RES_640X480", fallback="RES_160X120")
+            if self._render_agent_view:
+                # Host_agent: a janela do VizDoom fica oculta e mostramos a observação processada via OpenCV
+                g.set_screen_resolution(net_res_enum)
+                g.set_screen_format(vzd.ScreenFormat.GRAY8)
+                g.set_render_hud(False)
+                g.set_render_crosshair(False)
+                g.set_render_weapon(False)
+                g.set_window_visible(False)
+            else:
+                # Janela (debug): alta resolução
+                window_res_enum = _get_res_enum("RES_640X480", fallback="RES_160X120")
 
-            # Formato conforme YAML (debug)
-            try:
-                fmt_enum = getattr(vzd.ScreenFormat, rs.format)
-            except Exception:
-                print(f"[ENV][WARN] Formato inválido em render_settings: {rs.format!r}, usando GRAY8.")
-                fmt_enum = vzd.ScreenFormat.GRAY8
+                # Formato conforme YAML (debug)
+                try:
+                    fmt_enum = getattr(vzd.ScreenFormat, rs.format)
+                except Exception:
+                    print(f"[ENV][WARN] Formato inválido em render_settings: {rs.format!r}, usando GRAY8.")
+                    fmt_enum = vzd.ScreenFormat.GRAY8
 
-            g.set_screen_resolution(window_res_enum)
-            g.set_screen_format(fmt_enum)
+                g.set_screen_resolution(window_res_enum)
+                g.set_screen_format(fmt_enum)
 
-            g.set_render_hud(bool(rs.hud))
-            g.set_render_crosshair(False)
-            g.set_render_weapon(True)
-            g.set_window_visible(True)
+                g.set_render_hud(bool(rs.hud))
+                g.set_render_crosshair(False)
+                g.set_render_weapon(True)
+                g.set_window_visible(True)
 
         else:
             # Headless (treino): igual rede, GRAY8, sem overlays -> evita cv2.cvtColor/resize
@@ -165,15 +212,20 @@ class DoomDMEnv(gym.Env):
         g.add_available_game_variable(GameVariable.HEALTH)
         g.add_available_game_variable(GameVariable.ARMOR)
         g.add_available_game_variable(GameVariable.AMMO2)
+        g.add_available_game_variable(GameVariable.DAMAGECOUNT)
         g.add_available_game_variable(GameVariable.FRAGCOUNT)
         g.add_available_game_variable(GameVariable.DEATHCOUNT)
         g.add_available_game_variable(GameVariable.HITCOUNT)
         g.add_available_game_variable(GameVariable.HITS_TAKEN)
+        g.add_available_game_variable(GameVariable.POSITION_X)
+        g.add_available_game_variable(GameVariable.POSITION_Y)
+        g.add_available_game_variable(GameVariable.ANGLE)
 
         apply_engine_rewards(g, self.agent.reward.engine)
 
         # Ticrate
-        g.set_ticrate(30 if self.agent.train else 35)
+        ticrate = int(getattr(self.dm, "ticrate", 30 if self.agent.train else 35))
+        g.set_ticrate(ticrate)
         g.set_episode_timeout(0)
         g.set_episode_start_time(0)
 
@@ -186,9 +238,8 @@ class DoomDMEnv(gym.Env):
         extra_file_arg = ""
         wad = getattr(self.dm, "wad", None)
         if wad:
-            wad = str(wad).strip()
-            if wad:
-                wad_path = wad
+            wad_path = self._resolve_map_asset(wad)
+            if wad_path:
                 if not os.path.isfile(wad_path):
                     # tenta achar em framework/maps (relativo ao arquivo env.py)
                     base_dir = os.path.dirname(__file__)
@@ -234,6 +285,12 @@ class DoomDMEnv(gym.Env):
             )
 
         g.add_game_args(args + common)
+        print(
+            f"[ENV] Runtime: scenario={scenario_path!r}, map={self.dm.map_name!r}, "
+            f"frame_skip={int(self.dm.frame_skip)}, ticrate={ticrate}, render={bool(self.dm.render)}, "
+            f"render_agent_view={self._render_agent_view}",
+            flush=True,
+        )
 
         print(f"[ENV] Chamando game.init() (is_host={self.is_host}, name={self.name})")
         g.init()
@@ -278,6 +335,53 @@ class DoomDMEnv(gym.Env):
         self.shaper = RewardShaper(self.agent.reward.shaping)
         self._last_obs: Optional[np.ndarray] = None
         self._engine_episode_count: int = 0
+
+    def _motion_snapshot(self) -> Tuple[float, float, float]:
+        return (
+            float(self.game.get_game_variable(GameVariable.POSITION_X)),
+            float(self.game.get_game_variable(GameVariable.POSITION_Y)),
+            float(self.game.get_game_variable(GameVariable.ANGLE)),
+        )
+
+    @staticmethod
+    def _angle_delta_deg(before_deg: float, after_deg: float) -> float:
+        delta = (after_deg - before_deg + 180.0) % 360.0 - 180.0
+        return abs(delta)
+
+    def _wall_stuck_penalty(self, action_buttons: List[int], before: Tuple[float, float, float], after: Tuple[float, float, float]) -> float:
+        cfg = self.agent.reward.shaping
+        penalty = float(getattr(cfg, "wall_stuck_penalty", 0.0))
+        if penalty >= 0.0:
+            return 0.0
+
+        move_attempt = bool(action_buttons[0] or action_buttons[1] or action_buttons[2])
+        if not move_attempt:
+            return 0.0
+
+        dx = after[0] - before[0]
+        dy = after[1] - before[1]
+        dist = float((dx * dx + dy * dy) ** 0.5)
+        angle_delta = self._angle_delta_deg(before[2], after[2])
+
+        min_move = float(getattr(cfg, "wall_stuck_min_move", 1.0))
+        max_turn_deg = float(getattr(cfg, "wall_stuck_max_turn_deg", 5.0))
+
+        if dist < min_move and angle_delta < max_turn_deg:
+            return penalty
+        return 0.0
+
+    def _show_agent_view_window(self, obs: np.ndarray) -> None:
+        if not self._render_agent_view:
+            return
+        try:
+            frame = np.asarray(obs)
+            if frame.ndim == 3 and frame.shape[2] == 1:
+                frame = frame[:, :, 0]
+            frame = np.ascontiguousarray(frame, dtype=np.uint8)
+            cv2.imshow(self._agent_view_window_name, frame)
+            cv2.waitKey(1)
+        except Exception as e:
+            print(f"[ENV][WARN] Falha ao desenhar host_agent view: {e!r}")
 
     # ----------------------------------------------------------------------
     # Obs: SEMPRE (NET_H, NET_W, 1) uint8
@@ -356,6 +460,7 @@ class DoomDMEnv(gym.Env):
 
         self.shaper.reset(g)
         obs = self._read_obs()
+        self._show_agent_view_window(obs)
 
         print(
             f"[ENV] reset() concluído (is_host={self.is_host}, name={self.name}, "
@@ -369,8 +474,11 @@ class DoomDMEnv(gym.Env):
                 self.game.respawn_player()
 
             a = self._actions[int(action)].tolist()
+            motion_before = self._motion_snapshot()
             engine_r = float(self.game.make_action(a, int(self.dm.frame_skip)))
             shaped_r = self.shaper.compute(self.game, engine_r)
+            motion_after = self._motion_snapshot()
+            shaped_r += self._wall_stuck_penalty(a, motion_before, motion_after)
 
             if self.game.is_episode_finished():
                 print(
@@ -388,6 +496,7 @@ class DoomDMEnv(gym.Env):
                 )
 
             obs = self._read_obs()
+            self._show_agent_view_window(obs)
 
             info: Dict[str, Any] = {
                 "engine_r": engine_r,
@@ -410,6 +519,11 @@ class DoomDMEnv(gym.Env):
 
     def close(self):
         print(f"[ENV] close() chamado (is_host={self.is_host}, name={self.name})")
+        if self._render_agent_view:
+            try:
+                cv2.destroyWindow(self._agent_view_window_name)
+            except Exception:
+                pass
         try:
             self.game.close()
         except Exception as e:

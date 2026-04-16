@@ -99,7 +99,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--render",
-        choices=["none", "host", "all"],
+        choices=["none", "host", "host_agent", "all"],
         default="host",
         help="Renderização: none (sem janela), host (só host), all (todos).",
     )
@@ -107,6 +107,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trainer-port", type=int, default=7000)
     parser.add_argument("--auth-key", default="vizdoom_dm")
     parser.add_argument("--chunk-steps", type=int, default=50_000)
+    parser.add_argument("--host-start-delay", type=float, default=1.5)
+    parser.add_argument("--actor-start-delay", type=float, default=0.05)
+    parser.add_argument(
+        "--scenario",
+        default=None,
+        help="Cenário base .cfg/.wad/.pk3 em framework/maps ou caminho completo.",
+    )
+    parser.add_argument(
+        "--frame-skip",
+        type=int,
+        default=8,
+        help="Frames repetidos por ação. Menor = visual mais suave, maior = treino mais rápido.",
+    )
+    parser.add_argument(
+        "--ticrate",
+        type=int,
+        default=30,
+        help="Tickrate do motor. Maior = simulação/render mais suaves, mas mais pesados.",
+    )
 
     # Mapa e wad/pk3
     parser.add_argument("--map", default="map01", help="Nome do mapa (ex: map01, MAP01).")
@@ -123,13 +142,28 @@ def parse_args() -> argparse.Namespace:
         help="Usa shared memory para observações (mesma máquina). Requer suporte no trainer/actor.",
     )
 
+    parser.add_argument(
+        "--warmstart-reset-steps",
+        action="store_true",
+        help="Carrega so os pesos do modelo salvo e reinicia steps/schedules do zero.",
+    )
+
     return parser.parse_args()
 
 
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
-def _maybe_add_wad_and_map(cmd: List[str], map_name: str, wad: Optional[str]) -> None:
+def _maybe_add_scenario_map_and_wad(
+    cmd: List[str],
+    scenario: Optional[str],
+    map_name: str,
+    wad: Optional[str],
+) -> None:
+    if scenario is not None:
+        scenario = str(scenario).strip()
+        if scenario:
+            cmd += ["--scenario", scenario]
     cmd += ["--map", str(map_name)]
     if wad is not None:
         wad = str(wad).strip()
@@ -140,6 +174,8 @@ def _maybe_add_wad_and_map(cmd: List[str], map_name: str, wad: Optional[str]) ->
 def _apply_render_flags(cmd: List[str], render: str) -> None:
     if render == "all":
         cmd.append("--render-all")
+    elif render == "host_agent":
+        cmd.append("--render-host-agent")
     elif render == "host":
         cmd.append("--render-host")
     # render == "none" -> sem flag
@@ -187,11 +223,21 @@ def build_single_model_cmd_from_cfg(args: argparse.Namespace) -> List[str]:
         str(args.trainer_port),
         "--auth-key",
         args.auth_key,
+        "--host-start-delay",
+        str(args.host_start_delay),
+        "--actor-start-delay",
+        str(args.actor_start_delay),
+        "--frame-skip",
+        str(args.frame_skip),
+        "--ticrate",
+        str(args.ticrate),
     ]
 
-    _maybe_add_wad_and_map(cmd, args.map, args.wad)
+    _maybe_add_scenario_map_and_wad(cmd, args.scenario, args.map, args.wad)
     _apply_render_flags(cmd, args.render)
     _maybe_add_shm_obs(cmd, bool(args.shm_obs))
+    if args.warmstart_reset_steps:
+        cmd.append("--warmstart-reset-steps")
     return cmd
 
 
@@ -249,14 +295,24 @@ def build_multi_model_cmd(args: argparse.Namespace) -> List[str]:
         args.auth_key,
         "--chunk-steps",
         str(args.chunk_steps),
+        "--host-start-delay",
+        str(args.host_start_delay),
+        "--actor-start-delay",
+        str(args.actor_start_delay),
+        "--frame-skip",
+        str(args.frame_skip),
+        "--ticrate",
+        str(args.ticrate),
     ]
 
     for spec in args.agent:
         cmd.extend(["--agent", spec])
 
-    _maybe_add_wad_and_map(cmd, args.map, args.wad)
+    _maybe_add_scenario_map_and_wad(cmd, args.scenario, args.map, args.wad)
     _apply_render_flags(cmd, args.render)
     _maybe_add_shm_obs(cmd, bool(args.shm_obs))
+    if args.warmstart_reset_steps:
+        cmd.append("--warmstart-reset-steps")
     return cmd
 
 

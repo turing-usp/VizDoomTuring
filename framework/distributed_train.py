@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import csv
 import os
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from multiprocessing.connection import Connection, Listener, wait
 from typing import Any, Dict, List, Set, Tuple, Optional
 
 import numpy as np
+import torch
 from gymnasium import spaces
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import VecEnv, VecFrameStack, VecTransposeImage
@@ -112,6 +114,20 @@ class RemoteDMVecEnv(VecEnv):
 
         self._use_shm: bool = False
         self._shm: Optional[SharedObsManager] = None
+        self._step_async_started_at: Optional[float] = None
+        self._last_reply_span_s: float = 0.0
+        self._perf_last_log_at: float = time.time()
+        self._perf_step_calls: int = 0
+        self._perf_env_steps: int = 0
+        self._perf_done_count: int = 0
+        self._perf_wait_total_s: float = 0.0
+        self._perf_wait_max_s: float = 0.0
+        self._perf_batch_total_s: float = 0.0
+        self._perf_batch_max_s: float = 0.0
+        self._perf_reply_span_total_s: float = 0.0
+        self._perf_reply_span_max_s: float = 0.0
+        self._perf_csv_path: Optional[str] = None
+        self._perf_csv_header_written: bool = False
 
         super().__init__(
             num_envs=len(conns),
@@ -123,6 +139,78 @@ class RemoteDMVecEnv(VecEnv):
         if shm_obs:
             self._try_enable_shm_obs()
 
+    def _log_perf_window_if_due(self) -> None:
+        now = time.time()
+        elapsed = now - self._perf_last_log_at
+        if elapsed < 5.0 or self._perf_step_calls <= 0:
+            return
+
+        step_calls = self._perf_step_calls
+        env_steps = self._perf_env_steps
+        avg_wait_ms = (self._perf_wait_total_s / step_calls) * 1000.0
+        max_wait_ms = self._perf_wait_max_s * 1000.0
+        avg_batch_ms = (self._perf_batch_total_s / step_calls) * 1000.0
+        max_batch_ms = self._perf_batch_max_s * 1000.0
+        avg_reply_span_ms = (self._perf_reply_span_total_s / step_calls) * 1000.0
+        max_reply_span_ms = self._perf_reply_span_max_s * 1000.0
+        vec_steps_per_s = step_calls / elapsed
+        env_steps_per_s = env_steps / elapsed
+
+        status = "ok"
+        if avg_batch_ms > 500.0 or max_reply_span_ms > 1000.0:
+            status = "warn"
+        if avg_batch_ms > 1000.0 or max_reply_span_ms > 3000.0:
+            status = "critical"
+
+        print(
+            f"[TRAIN][PERF][{status}] window={elapsed:.1f}s "
+            f"vec_steps/s={vec_steps_per_s:.2f} env_steps/s={env_steps_per_s:.2f} "
+            f"actor_decisions/s={vec_steps_per_s:.2f} "
+            f"step_wait_ms(avg/max)={avg_wait_ms:.1f}/{max_wait_ms:.1f} "
+            f"batch_ms(avg/max)={avg_batch_ms:.1f}/{max_batch_ms:.1f} "
+            f"reply_span_ms(avg/max)={avg_reply_span_ms:.1f}/{max_reply_span_ms:.1f} "
+            f"dones={self._perf_done_count}",
+            flush=True,
+        )
+
+        if self._perf_csv_path:
+            os.makedirs(os.path.dirname(self._perf_csv_path), exist_ok=True)
+            row = {
+                "window_s": round(elapsed, 6),
+                "vec_steps_per_s": round(vec_steps_per_s, 6),
+                "env_steps_per_s": round(env_steps_per_s, 6),
+                "actor_decisions_per_s": round(vec_steps_per_s, 6),
+                "step_wait_ms_avg": round(avg_wait_ms, 6),
+                "step_wait_ms_max": round(max_wait_ms, 6),
+                "batch_ms_avg": round(avg_batch_ms, 6),
+                "batch_ms_max": round(max_batch_ms, 6),
+                "reply_span_ms_avg": round(avg_reply_span_ms, 6),
+                "reply_span_ms_max": round(max_reply_span_ms, 6),
+                "dones": int(self._perf_done_count),
+                "status": status,
+            }
+            write_header = (not self._perf_csv_header_written) and (not os.path.exists(self._perf_csv_path))
+            with open(self._perf_csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+            self._perf_csv_header_written = True
+
+        self._perf_last_log_at = now
+        self._perf_step_calls = 0
+        self._perf_env_steps = 0
+        self._perf_done_count = 0
+        self._perf_wait_total_s = 0.0
+        self._perf_wait_max_s = 0.0
+        self._perf_batch_total_s = 0.0
+        self._perf_batch_max_s = 0.0
+        self._perf_reply_span_total_s = 0.0
+        self._perf_reply_span_max_s = 0.0
+
+    def set_perf_csv_path(self, perf_csv_path: str) -> None:
+        self._perf_csv_path = perf_csv_path
+
     def _wait_for_replies(
         self,
         pendentes: Set[int],
@@ -133,6 +221,29 @@ class RemoteDMVecEnv(VecEnv):
         t0 = time.time()
         last_log = time.time()
         conn_map = {self._conns[i]: i for i in pendentes}
+        max_wait_handles = 60
+        first_reply_at: Optional[float] = None
+        last_reply_at: Optional[float] = None
+
+        def wait_chunked(conns: List[Connection], timeout: float) -> List[Connection]:
+            if len(conns) <= max_wait_handles:
+                return list(wait(conns, timeout=timeout))
+
+            ready: List[Connection] = []
+            deadline = time.time() + timeout
+
+            while True:
+                for start in range(0, len(conns), max_wait_handles):
+                    batch = conns[start:start + max_wait_handles]
+                    ready.extend(wait(batch, timeout=0.0))
+
+                if ready:
+                    return ready
+
+                if time.time() >= deadline:
+                    return []
+
+                time.sleep(0.01)
 
         while pendentes:
             if time.time() - t0 > timeout_total:
@@ -149,7 +260,7 @@ class RemoteDMVecEnv(VecEnv):
                 last_log = time.time()
 
             conns_to_wait = [self._conns[i] for i in pendentes]
-            ready_conns = wait(conns_to_wait, timeout=0.1)
+            ready_conns = wait_chunked(conns_to_wait, timeout=0.1)
 
             for conn in ready_conns:
                 idx = conn_map.get(conn)
@@ -160,6 +271,10 @@ class RemoteDMVecEnv(VecEnv):
                     msg = conn.recv()
                     if isinstance(msg, dict) and "error" in msg:
                         raise RuntimeError(f"[TRAIN] Ator {idx} reportou erro: {msg['error']}")
+                    now = time.time()
+                    if first_reply_at is None:
+                        first_reply_at = now
+                    last_reply_at = now
                     results[idx] = msg
                     pendentes.remove(idx)
                 except EOFError:
@@ -169,6 +284,11 @@ class RemoteDMVecEnv(VecEnv):
                 except Exception as e:
                     print(f"[TRAIN][ERROR] Exceção ao ler ator {idx} em {context}: {e!r}", flush=True)
                     raise
+
+        if first_reply_at is not None and last_reply_at is not None:
+            self._last_reply_span_s = max(0.0, last_reply_at - first_reply_at)
+        else:
+            self._last_reply_span_s = 0.0
 
         return results
 
@@ -287,6 +407,7 @@ class RemoteDMVecEnv(VecEnv):
 
     def step_async(self, actions):
         actions = np.array(actions).reshape((self.num_envs,))
+        self._step_async_started_at = time.time()
         for idx, (conn, act) in enumerate(zip(self._conns, actions)):
             try:
                 conn.send({"cmd": "step", "action": int(act)})
@@ -296,12 +417,19 @@ class RemoteDMVecEnv(VecEnv):
         self._waiting = True
 
     def step_wait(self):
+        wait_started_at = time.time()
         msgs = self._wait_for_replies(
             pendentes=set(range(self.num_envs)),
             timeout_total=60.0,
             context="step_wait()",
         )
         self._waiting = False
+        wait_elapsed_s = time.time() - wait_started_at
+        batch_elapsed_s = (
+            time.time() - self._step_async_started_at
+            if self._step_async_started_at is not None
+            else wait_elapsed_s
+        )
 
         obs_shape = self.observation_space.shape
         if self._use_shm:
@@ -353,6 +481,17 @@ class RemoteDMVecEnv(VecEnv):
             rewards[idx] = rew
             dones[idx] = done
             infos.append(info)
+
+        self._perf_step_calls += 1
+        self._perf_env_steps += self.num_envs
+        self._perf_done_count += int(np.count_nonzero(dones))
+        self._perf_wait_total_s += wait_elapsed_s
+        self._perf_wait_max_s = max(self._perf_wait_max_s, wait_elapsed_s)
+        self._perf_batch_total_s += batch_elapsed_s
+        self._perf_batch_max_s = max(self._perf_batch_max_s, batch_elapsed_s)
+        self._perf_reply_span_total_s += self._last_reply_span_s
+        self._perf_reply_span_max_s = max(self._perf_reply_span_max_s, self._last_reply_span_s)
+        self._log_perf_window_if_due()
 
         if self._use_shm:
             return obs_batch, rewards, dones, infos
@@ -415,15 +554,39 @@ class RemoteDMVecEnv(VecEnv):
 # ============================================================
 
 class DebugCallback(BaseCallback):
-    def __init__(self, log_every: int = 1_000, reward_window: int = 10_000, verbose: int = 0):
+    def __init__(
+        self,
+        log_every: int = 1_000,
+        reward_window: int = 10_000,
+        metrics_csv_path: Optional[str] = None,
+        verbose: int = 0,
+    ):
         super().__init__(verbose)
         self.log_every = log_every
         self.reward_window = reward_window
+        self.metrics_csv_path = metrics_csv_path
         self._last = 0
         self._recent_rewards = collections.deque(maxlen=reward_window)
         self._rollout_start_time: float | None = None
+        self._train_started_at: float | None = None
+        self._csv_header_written: bool = False
+
+    def _append_metrics_row(self, row: Dict[str, Any]) -> None:
+        if not self.metrics_csv_path:
+            return
+
+        os.makedirs(os.path.dirname(self.metrics_csv_path), exist_ok=True)
+        fieldnames = list(row.keys())
+        write_header = (not self._csv_header_written) and (not os.path.exists(self.metrics_csv_path))
+        with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        self._csv_header_written = True
 
     def _on_training_start(self) -> None:
+        self._train_started_at = time.time()
         print("[DEBUG] == TRAINING START ==")
 
     def _on_rollout_start(self) -> None:
@@ -435,10 +598,46 @@ class DebugCallback(BaseCallback):
         dt = None
         if self._rollout_start_time is not None:
             dt = now - self._rollout_start_time
+        logger_values = dict(getattr(getattr(self.model, "logger", None), "name_to_value", {}))
+        time_elapsed = None
+        if self._train_started_at is not None:
+            time_elapsed = now - self._train_started_at
+        fps = None
+        if time_elapsed and time_elapsed > 0:
+            fps = float(self.num_timesteps) / float(time_elapsed)
+        mean_reward_window = (
+            float(sum(self._recent_rewards) / len(self._recent_rewards))
+            if self._recent_rewards
+            else float("nan")
+        )
+
         print(
             f"[DEBUG] ==== ROLLOUT END (num_timesteps={self.num_timesteps}) "
             + (f"duracao={dt:.2f}s" if dt is not None else "")
         )
+
+        row: Dict[str, Any] = {
+            "wall_time_s": round(time_elapsed, 6) if time_elapsed is not None else "",
+            "num_timesteps": int(self.num_timesteps),
+            "rollout_duration_s": round(dt, 6) if dt is not None else "",
+            "fps": round(fps, 6) if fps is not None else "",
+            "reward_mean_window": round(mean_reward_window, 6) if np.isfinite(mean_reward_window) else "",
+            "train_learning_rate": logger_values.get("train/learning_rate", ""),
+            "train_entropy_loss": logger_values.get("train/entropy_loss", ""),
+            "train_policy_gradient_loss": logger_values.get("train/policy_gradient_loss", ""),
+            "train_value_loss": logger_values.get("train/value_loss", ""),
+            "train_loss": logger_values.get("train/loss", ""),
+            "train_approx_kl": logger_values.get("train/approx_kl", ""),
+            "train_clip_fraction": logger_values.get("train/clip_fraction", ""),
+            "train_explained_variance": logger_values.get("train/explained_variance", ""),
+            "train_std": logger_values.get("train/std", ""),
+            "rollout_ep_rew_mean": logger_values.get("rollout/ep_rew_mean", ""),
+            "rollout_ep_len_mean": logger_values.get("rollout/ep_len_mean", ""),
+            "time_fps_logger": logger_values.get("time/fps", ""),
+            "time_iterations": logger_values.get("time/iterations", ""),
+            "time_total_timesteps_logger": logger_values.get("time/total_timesteps", ""),
+        }
+        self._append_metrics_row(row)
 
     def _on_training_end(self) -> None:
         print("[DEBUG] == TRAINING END ==")
@@ -474,14 +673,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timelimit", type=float, default=0.0)
     parser.add_argument("--stack", type=int, default=4)
     parser.add_argument("--render-host", action="store_true")
+    parser.add_argument("--render-host-agent", action="store_true")
     parser.add_argument("--render-all", action="store_true")
 
     parser.add_argument("--map", default="map01", help="Nome do mapa (ex: MAP01 / map01)")
+    parser.add_argument("--scenario", default=None, help="Cenário base .cfg/.wad/.pk3")
     parser.add_argument("--wad", default=None, help="Arquivo WAD/PK3 (nome em framework/maps ou caminho)")
+    parser.add_argument("--frame-skip", type=int, default=8)
+    parser.add_argument("--ticrate", type=int, default=30)
 
     parser.add_argument("--trainer-host", default="127.0.0.1")
     parser.add_argument("--trainer-port", type=int, default=7000)
     parser.add_argument("--auth-key", default="vizdoom_dm")
+    parser.add_argument("--host-start-delay", type=float, default=1.5)
+    parser.add_argument("--actor-start-delay", type=float, default=0.05)
 
     parser.add_argument(
         "--shm-obs",
@@ -489,7 +694,33 @@ def parse_args() -> argparse.Namespace:
         help="Usa shared memory para observações (requer distributed_actor com cmd set_shm_obs).",
     )
 
+    parser.add_argument(
+        "--warmstart-reset-steps",
+        action="store_true",
+        help="Carrega pesos do checkpoint, mas reinicia steps/schedules/otimizador do zero.",
+    )
+
     return parser.parse_args()
+
+
+def log_torch_device_info() -> None:
+    try:
+        print(
+            f"[TRAIN][GPU] torch={torch.__version__} cuda_available={torch.cuda.is_available()} "
+            f"cuda_version={torch.version.cuda}",
+            flush=True,
+        )
+        if torch.cuda.is_available():
+            for idx in range(torch.cuda.device_count()):
+                props = torch.cuda.get_device_properties(idx)
+                total_gib = props.total_memory / (1024 ** 3)
+                print(
+                    f"[TRAIN][GPU] device[{idx}]={torch.cuda.get_device_name(idx)} "
+                    f"vram={total_gib:.2f} GiB",
+                    flush=True,
+                )
+    except Exception as e:
+        print(f"[TRAIN][GPU][WARN] Falha ao coletar info da GPU: {e!r}", flush=True)
 
 
 def normalize_topology(args: argparse.Namespace) -> None:
@@ -543,8 +774,14 @@ def _build_actor_cmd(
         args.auth_key,
         "--map",
         str(args.map),
+        "--frame-skip",
+        str(args.frame_skip),
+        "--ticrate",
+        str(args.ticrate),
     ]
 
+    if args.scenario:
+        cmd += ["--scenario", str(args.scenario)]
     if args.wad:
         cmd += ["--wad", str(args.wad)]
 
@@ -552,6 +789,8 @@ def _build_actor_cmd(
         cmd.append("--is-host")
         if args.render_all or args.render_host:
             cmd.append("--render")
+        if args.render_host_agent:
+            cmd += ["--render", "--render-agent-view"]
     elif args.render_all:
         cmd.append("--render")
 
@@ -565,8 +804,8 @@ def launch_actors(args: argparse.Namespace, cfg_path: str) -> List[subprocess.Po
 
     module_name = "framework.distributed_actor"
 
-    spawn_delay_actor = 0.5
-    spawn_delay_host = 5.0
+    spawn_delay_actor = max(0.0, float(args.actor_start_delay))
+    spawn_delay_host = max(0.0, float(args.host_start_delay))
 
     print(f"[TRAIN] Lançando {num_matches} partidas... map={args.map!r} wad={args.wad!r}")
 
@@ -579,24 +818,125 @@ def launch_actors(args: argparse.Namespace, cfg_path: str) -> List[subprocess.Po
         print("[TRAIN][CMD-HOST]", " ".join(cmd_host))
         procs.append(subprocess.Popen(cmd_host))
 
-        print(f"[TRAIN] Aguardando {spawn_delay_host}s para Host iniciar...")
-        time.sleep(spawn_delay_host)
+    print(f"[TRAIN] Aguardando {spawn_delay_host}s para os hosts iniciarem...")
+    time.sleep(spawn_delay_host)
 
-        for local_idx in range(1, actors_per_match):
+    for local_idx in range(1, actors_per_match):
+        for match_idx in range(num_matches):
+            match_port = args.game_port + match_idx
             cmd_client = _build_actor_cmd(args, module_name, cfg_path, match_port, False, actors_per_match)
             print(f"[TRAIN] Lançando Cliente {local_idx}...")
             print("[TRAIN][CMD-CLI]", " ".join(cmd_client))
             procs.append(subprocess.Popen(cmd_client))
-            time.sleep(spawn_delay_actor)
+            if spawn_delay_actor > 0:
+                time.sleep(spawn_delay_actor)
 
     return procs
+
+
+def launch_actors_staggered(args: argparse.Namespace, cfg_path: str) -> List[subprocess.Popen]:
+    num_matches = args.num_matches
+    actors_per_match = args.actors_per_match
+    procs: List[subprocess.Popen] = []
+
+    module_name = "framework.distributed_actor"
+    spawn_delay_actor = max(0.0, float(args.actor_start_delay))
+    spawn_delay_host = max(0.0, float(args.host_start_delay))
+
+    print(f"[TRAIN] LanÃ§ando {num_matches} partidas de forma escalonada... map={args.map!r} wad={args.wad!r}")
+
+    for match_idx in range(num_matches):
+        match_port = args.game_port + match_idx
+        print(f"\n[TRAIN] === Partida {match_idx} (Porta {match_port}) ===")
+
+        cmd_host = _build_actor_cmd(args, module_name, cfg_path, match_port, True, actors_per_match)
+        print("[TRAIN] LanÃ§ando HOST...")
+        print("[TRAIN][CMD-HOST]", " ".join(cmd_host))
+        procs.append(subprocess.Popen(cmd_host))
+
+        if spawn_delay_host > 0:
+            print(f"[TRAIN] Aguardando {spawn_delay_host}s para Host da partida {match_idx} iniciar...")
+            time.sleep(spawn_delay_host)
+
+        for local_idx in range(1, actors_per_match):
+            cmd_client = _build_actor_cmd(args, module_name, cfg_path, match_port, False, actors_per_match)
+            print(f"[TRAIN] LanÃ§ando Cliente {local_idx} da partida {match_idx}...")
+            print("[TRAIN][CMD-CLI]", " ".join(cmd_client))
+            procs.append(subprocess.Popen(cmd_client))
+            if spawn_delay_actor > 0:
+                time.sleep(spawn_delay_actor)
+
+    return procs
+
+
+def accept_n_actor_conns(listener: Listener, expected: int, label: str) -> List[Connection]:
+    print(f"[TRAIN] Aguardando {expected} conexÃµes para {label}...")
+    conns: List[Connection] = []
+    for idx in range(expected):
+        try:
+            conns.append(listener.accept())
+        except Exception as e:
+            raise RuntimeError(
+                f"Falha ao aceitar conexÃ£o {idx+1}/{expected} de {label}: {e!r}"
+            ) from e
+        print(f"[TRAIN] {label}: {idx+1}/{expected} conectados.")
+    return conns
+
+
+def launch_actors_staggered_and_accept(
+    args: argparse.Namespace,
+    cfg_path: str,
+    listener: Listener,
+) -> Tuple[List[subprocess.Popen], List[Connection]]:
+    num_matches = args.num_matches
+    actors_per_match = args.actors_per_match
+    procs: List[subprocess.Popen] = []
+    conns: List[Connection] = []
+
+    module_name = "framework.distributed_actor"
+    spawn_delay_actor = max(0.0, float(args.actor_start_delay))
+    spawn_delay_host = max(0.0, float(args.host_start_delay))
+
+    print(f"[TRAIN] LanÃ§ando {num_matches} partidas de forma escalonada com handshake por partida... map={args.map!r} wad={args.wad!r}")
+
+    for match_idx in range(num_matches):
+        match_port = args.game_port + match_idx
+        label = f"partida {match_idx}"
+        print(f"\n[TRAIN] === Partida {match_idx} (Porta {match_port}) ===")
+
+        cmd_host = _build_actor_cmd(args, module_name, cfg_path, match_port, True, actors_per_match)
+        print("[TRAIN] LanÃ§ando HOST...")
+        print("[TRAIN][CMD-HOST]", " ".join(cmd_host))
+        procs.append(subprocess.Popen(cmd_host))
+
+        if spawn_delay_host > 0:
+            print(f"[TRAIN] Aguardando {spawn_delay_host}s para Host da partida {match_idx} iniciar...")
+            time.sleep(spawn_delay_host)
+
+        for local_idx in range(1, actors_per_match):
+            cmd_client = _build_actor_cmd(args, module_name, cfg_path, match_port, False, actors_per_match)
+            print(f"[TRAIN] LanÃ§ando Cliente {local_idx} da partida {match_idx}...")
+            print("[TRAIN][CMD-CLI]", " ".join(cmd_client))
+            procs.append(subprocess.Popen(cmd_client))
+            if spawn_delay_actor > 0:
+                time.sleep(spawn_delay_actor)
+
+        conns.extend(accept_n_actor_conns(listener, actors_per_match, label))
+
+    return procs, conns
 
 
 def accept_actor_conns(listener: Listener, num_actors: int) -> List[Connection]:
     print(f"[TRAIN] Aguardando {num_actors} conexões (Socket)...")
     conns: List[Connection] = []
     for i in range(num_actors):
-        conns.append(listener.accept())
+        try:
+            conns.append(listener.accept())
+        except Exception as e:
+            raise RuntimeError(
+                f"Falha ao aceitar conexÃ£o {i+1}/{num_actors}. "
+                f"Algum ator provavelmente caiu durante a inicializaÃ§Ã£o: {e!r}"
+            ) from e
         print(f"[TRAIN] {i+1}/{num_actors} conectados.")
     return conns
 
@@ -614,6 +954,17 @@ def build_vec_env(conns: List[Connection], stack: int, *, shm_obs: bool) -> VecE
     env: VecEnv = VecTransposeImage(base_env)
     env = VecFrameStack(env, n_stack=int(stack), channels_order="first")
     return env
+
+
+def _find_remote_base_env(env: Any) -> Optional[RemoteDMVecEnv]:
+    cur = env
+    visited = set()
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        if isinstance(cur, RemoteDMVecEnv):
+            return cur
+        cur = getattr(cur, "venv", None)
+    return None
 
 
 def auto_adjust_n_steps(
@@ -661,10 +1012,32 @@ def auto_adjust_n_steps(
     return agent_cfg
 
 
-def build_model(agent_cfg: AgentConfig, env: VecEnv, save_path: str):
+def build_model(
+    agent_cfg: AgentConfig,
+    env: VecEnv,
+    save_path: str,
+    *,
+    warmstart_reset_steps: bool = False,
+):
     algo_cls = resolve_algo(agent_cfg.policy.algo)
     print("[DEBUG] learn_kwargs:", agent_cfg.policy.learn_kwargs)
     if os.path.exists(save_path):
+        if warmstart_reset_steps:
+            print(f"[TRAIN] Warm start com reset de steps a partir de: {save_path}")
+            try:
+                loaded_model = algo_cls.load(save_path, env=env)
+                fresh_model = build_sb3(
+                    algo_cls,
+                    "CnnPolicy",
+                    env,
+                    agent_cfg.policy.policy_kwargs,
+                    agent_cfg.policy.learn_kwargs,
+                )
+                fresh_model.policy.load_state_dict(loaded_model.policy.state_dict(), strict=True)
+                return fresh_model
+            except Exception as e:
+                print(f"[TRAIN] Erro no warm start: {e!r}. Caindo para carregamento normal.")
+
         print(f"[TRAIN] Carregando modelo: {save_path}")
         try:
             return algo_cls.load(save_path, env=env)
@@ -714,20 +1087,63 @@ def _set_chunk_lr(model, target_total_steps: int) -> None:
     )
 
 
-def train_distributed(agent_cfg: AgentConfig, env: VecEnv) -> None:
+def _set_chunk_ent_coef(model, target_total_steps: int) -> None:
+    ent_range = getattr(model, "_ent_coef_range", None)
+    if not ent_range:
+        return
+
+    max_ent, min_ent = ent_range
+    total = max(int(target_total_steps), 1)
+    t = int(getattr(model, "num_timesteps", 0))
+    progress = max(0.0, min(1.0, t / total))
+    ent_coef = float(max_ent) - (float(max_ent) - float(min_ent)) * progress
+
+    try:
+        model.ent_coef = ent_coef
+    except Exception:
+        pass
+
+    print(
+        f"[TRAIN][ENT] num_timesteps={t}/{total}, progress={progress:.4f}, ent_coef_chunk={ent_coef}",
+        flush=True,
+    )
+
+
+def train_distributed(
+    agent_cfg: AgentConfig,
+    env: VecEnv,
+    *,
+    warmstart_reset_steps: bool = False,
+) -> None:
     agent_cfg = replace(agent_cfg, train=True)
 
     agent_cfg = auto_adjust_n_steps(
         agent_cfg,
         env,
-        max_rollout_gib=4.0,
-        safety_factor=4.0,
+        max_rollout_gib=12.0,
+        safety_factor=2.0,
     )
 
     os.makedirs(agent_cfg.model_dir, exist_ok=True)
     save_path = os.path.join(agent_cfg.model_dir, agent_cfg.model_name)
+    metrics_csv_path = os.path.join(
+        agent_cfg.model_dir,
+        f"{os.path.splitext(agent_cfg.model_name)[0]}_metrics.csv",
+    )
+    perf_csv_path = os.path.join(
+        agent_cfg.model_dir,
+        f"{os.path.splitext(agent_cfg.model_name)[0]}_perf.csv",
+    )
 
-    model = build_model(agent_cfg, env, save_path)
+    model = build_model(
+        agent_cfg,
+        env,
+        save_path,
+        warmstart_reset_steps=warmstart_reset_steps,
+    )
+    remote_base_env = _find_remote_base_env(env)
+    if remote_base_env is not None:
+        remote_base_env.set_perf_csv_path(perf_csv_path)
 
     target = int(agent_cfg.train_steps)
     already = int(getattr(model, "num_timesteps", 0))
@@ -736,11 +1152,14 @@ def train_distributed(agent_cfg: AgentConfig, env: VecEnv) -> None:
     print(f"[TRAIN] alvo_total={target}, ja_treinado={already}, restante={remaining}")
 
     chunk_max = 50_000
-    callback = DebugCallback(log_every=1_000)
+    callback = DebugCallback(log_every=1_000, metrics_csv_path=metrics_csv_path)
+    print(f"[TRAIN] MÃ©tricas RL em CSV: {metrics_csv_path}")
+    print(f"[TRAIN] MÃ©tricas de estabilidade em CSV: {perf_csv_path}")
 
     while remaining > 0:
         cur = min(chunk_max, remaining)
         _set_chunk_lr(model, target_total_steps=target)
+        _set_chunk_ent_coef(model, target_total_steps=target)
 
         print(f"[TRAIN] Iniciando chunk: {cur} steps (Restam: {remaining})")
         model.learn(
@@ -758,6 +1177,7 @@ def train_distributed(agent_cfg: AgentConfig, env: VecEnv) -> None:
 def main() -> None:
     args = parse_args()
     normalize_topology(args)
+    log_torch_device_info()
 
     agent_cfg = load_agent_cfg(args.cfg)
     listener, _ = start_listener(args)
@@ -768,10 +1188,13 @@ def main() -> None:
 
     actors: List[subprocess.Popen] = []
     try:
-        actors = launch_actors(args, cfg_path=args.cfg)
-        conns = accept_actor_conns(listener, args.num_actors)
+        actors, conns = launch_actors_staggered_and_accept(args, cfg_path=args.cfg, listener=listener)
         env = build_vec_env(conns, stack=stack, shm_obs=bool(args.shm_obs))
-        train_distributed(agent_cfg, env)
+        train_distributed(
+            agent_cfg,
+            env,
+            warmstart_reset_steps=bool(args.warmstart_reset_steps),
+        )
         env.close()
 
     except KeyboardInterrupt:

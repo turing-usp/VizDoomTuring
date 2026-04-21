@@ -68,9 +68,25 @@ class ShapingConfig:
     w_deaths: float = 0.0
     step_penalty: float = 0.0
     wall_stuck_penalty: float = 0.0
-    wall_stuck_min_move: float = 1.0
-    wall_stuck_max_turn_deg: float = 5.0
+    enemy_in_view_reward: float = 0.0
+    w_speed: float = 0.0
+    idle_speed_threshold: float = 0.0
+    idle_penalty: float = 0.0
     include_engine_reward: bool = False
+
+
+@dataclass(frozen=True)
+class WallStuckConfig:
+    min_move: float = 1.0
+    max_turn_deg: float = 5.0
+    persist_steps: int = 4
+
+
+@dataclass(frozen=True)
+class EnemyInViewConfig:
+    check_every: int = 2
+    cooldown_steps: int = 3
+    min_area_ratio: float = 0.002
 
 
 @dataclass(frozen=True)
@@ -85,6 +101,12 @@ class RenderSettingsConfig:
     resolution: str = "RES_160X120"  # Ex.: RES_120X90, RES_160X120
     format: str = "GRAY8"            # RGB24 ou GRAY8
     hud: bool = False                # Mostrar interface
+    weapon: bool = False             # Mostrar arma na observacao da rede
+    crosshair: bool = False
+    enemy_outline: bool = False      # Desenha contorno de jogadores na observacao da rede
+    enemy_outline_value: int = 255   # Intensidade do contorno em GRAY8
+    enemy_outline_thickness: int = 2
+    enemy_outline_pattern: str = "solid"  # solid ou checker
 
 
 @dataclass(frozen=True)
@@ -105,6 +127,8 @@ class RewardConfig:
     """
     engine: EngineRewardConfig = EngineRewardConfig()
     shaping: ShapingConfig = ShapingConfig()
+    wall_stuck: WallStuckConfig = WallStuckConfig()
+    enemy_in_view: EnemyInViewConfig = EnemyInViewConfig()
 
 
 @dataclass(frozen=True)

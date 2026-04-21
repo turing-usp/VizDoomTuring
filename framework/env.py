@@ -13,7 +13,14 @@ import vizdoom as vzd
 from vizdoom import Button, GameVariable
 
 from .config import DMConfig, AgentConfig
-from .rewards import RewardShaper, apply_engine_rewards
+from .rewards import (
+    RewardShaper,
+    ContextualRewardShaper,
+    MotionSnapshot,
+    StepVarsSnapshot,
+    apply_engine_rewards,
+    capture_vars,
+)
 
 
 class DoomDMEnv(gym.Env):
@@ -75,6 +82,7 @@ class DoomDMEnv(gym.Env):
         self._infinite_match: bool = self._timelimit_minutes <= 0.0
         self._render_agent_view: bool = bool(getattr(self.dm, "render_agent_view", False))
         self._agent_view_window_name: str = f"agent_view::{self.name}"
+        self._labels_enabled: bool = False
 
         print(
             f"[ENV] __init__() name={self.name}, is_host={self.is_host}, "
@@ -152,9 +160,9 @@ class DoomDMEnv(gym.Env):
                 # Host_agent: a janela do VizDoom fica oculta e mostramos a observação processada via OpenCV
                 g.set_screen_resolution(net_res_enum)
                 g.set_screen_format(vzd.ScreenFormat.GRAY8)
-                g.set_render_hud(False)
-                g.set_render_crosshair(False)
-                g.set_render_weapon(False)
+                g.set_render_hud(bool(rs.hud))
+                g.set_render_crosshair(bool(getattr(rs, "crosshair", False)))
+                g.set_render_weapon(bool(getattr(rs, "weapon", False)))
                 g.set_window_visible(False)
             else:
                 # Janela (debug): alta resolução
@@ -171,18 +179,18 @@ class DoomDMEnv(gym.Env):
                 g.set_screen_format(fmt_enum)
 
                 g.set_render_hud(bool(rs.hud))
-                g.set_render_crosshair(False)
-                g.set_render_weapon(True)
+                g.set_render_crosshair(bool(getattr(rs, "crosshair", False)))
+                g.set_render_weapon(bool(getattr(rs, "weapon", True)))
                 g.set_window_visible(True)
 
         else:
-            # Headless (treino): igual rede, GRAY8, sem overlays -> evita cv2.cvtColor/resize
+            # Headless (treino): igual rede, GRAY8, overlays conforme YAML.
             g.set_screen_resolution(net_res_enum)
             g.set_screen_format(vzd.ScreenFormat.GRAY8)
 
-            g.set_render_hud(False)
-            g.set_render_crosshair(False)
-            g.set_render_weapon(False)
+            g.set_render_hud(bool(rs.hud))
+            g.set_render_crosshair(bool(getattr(rs, "crosshair", False)))
+            g.set_render_weapon(bool(getattr(rs, "weapon", False)))
             g.set_window_visible(False)
 
             # Como headless é GRAY8, não precisamos de cv2 para converter
@@ -200,6 +208,7 @@ class DoomDMEnv(gym.Env):
             Button.MOVE_LEFT,
             Button.MOVE_RIGHT,
             Button.MOVE_FORWARD,
+            Button.MOVE_BACKWARD,
             Button.TURN_LEFT,
             Button.TURN_RIGHT,
             Button.ATTACK,
@@ -220,8 +229,19 @@ class DoomDMEnv(gym.Env):
         g.add_available_game_variable(GameVariable.POSITION_X)
         g.add_available_game_variable(GameVariable.POSITION_Y)
         g.add_available_game_variable(GameVariable.ANGLE)
+        g.add_available_game_variable(GameVariable.SELECTED_WEAPON)
+        g.add_available_game_variable(GameVariable.SELECTED_WEAPON_AMMO)
+        g.add_available_game_variable(GameVariable.VELOCITY_X)
+        g.add_available_game_variable(GameVariable.VELOCITY_Y)
+        g.add_available_game_variable(GameVariable.VELOCITY_Z)
 
         apply_engine_rewards(g, self.agent.reward.engine)
+
+        if hasattr(g, "set_labels_buffer_enabled"):
+            g.set_labels_buffer_enabled(True)
+            self._labels_enabled = True
+        else:
+            print("[ENV][WARN] Labels buffer nao suportado nesta versao do ViZDoom. enemy_in_view sera ignorado.")
 
         # Ticrate
         ticrate = int(getattr(self.dm, "ticrate", 30 if self.agent.train else 35))
@@ -301,14 +321,24 @@ class DoomDMEnv(gym.Env):
         # ------------------------------------------------------------------
         base_actions = np.asarray(
             [
-                [0, 0, 0, 0, 0, 0],
-                [0, 0, 1, 0, 0, 0],  # forward
-                [0, 0, 0, 1, 0, 0],  # turn_left
-                [0, 0, 0, 0, 1, 0],  # turn_right
-                [0, 0, 0, 0, 0, 1],  # forward+attack
-                [1, 0, 0, 0, 0, 0],  # move_left
-                [0, 1, 0, 0, 0, 0],  # move_right
-                [0, 0, 0, 0, 0, 1],  # attack
+                [0, 0, 0, 0, 0, 0, 0],  # noop
+                [0, 0, 1, 0, 0, 0, 0],  # forward
+                [0, 0, 0, 1, 0, 0, 0],  # backward
+                [0, 0, 0, 0, 1, 0, 0],  # turn_left
+                [0, 0, 0, 0, 0, 1, 0],  # turn_right
+                [1, 0, 0, 0, 0, 0, 0],  # move_left
+                [0, 1, 0, 0, 0, 0, 0],  # move_right
+                [0, 0, 0, 0, 0, 0, 1],  # attack
+                [0, 0, 1, 0, 0, 0, 1],  # forward+attack
+                [0, 0, 0, 1, 0, 0, 1],  # backward+attack
+                [0, 0, 0, 0, 1, 0, 1],  # turn_left+attack
+                [0, 0, 0, 0, 0, 1, 1],  # turn_right+attack
+                [1, 0, 0, 0, 0, 0, 1],  # move_left+attack
+                [0, 1, 0, 0, 0, 0, 1],  # move_right+attack
+                [0, 0, 1, 0, 1, 0, 0],  # forward+turn_left
+                [0, 0, 1, 0, 0, 1, 0],  # forward+turn_right
+                [0, 0, 1, 0, 1, 0, 1],  # forward+turn_left+attack
+                [0, 0, 1, 0, 0, 1, 1],  # forward+turn_right+attack
             ],
             dtype=np.int32,
         )
@@ -323,59 +353,51 @@ class DoomDMEnv(gym.Env):
         self._actions = base_actions
 
         # Spaces
-        self.observation_space = spaces.Box(
-            low=0,
-            high=255,
-            shape=(self.NET_H, self.NET_W, self.NET_C),
-            dtype=np.uint8,
+        self.STATE_DIM = 18
+        self.observation_space = spaces.Dict(
+            {
+                "image": spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(self.NET_C, self.NET_H, self.NET_W),
+                    dtype=np.uint8,
+                ),
+                "state": spaces.Box(
+                    low=-1.0,
+                    high=1.0,
+                    shape=(self.STATE_DIM,),
+                    dtype=np.float32,
+                ),
+            }
         )
         self.action_space = spaces.Discrete(len(self._actions))
 
         # Shaper
         self.shaper = RewardShaper(self.agent.reward.shaping)
+        self.contextual_shaper = ContextualRewardShaper(
+            self.agent.reward.shaping,
+            self.agent.reward.wall_stuck,
+            self.agent.reward.enemy_in_view,
+        )
         self._last_obs: Optional[np.ndarray] = None
+        self._last_state_vars: Optional[Dict[str, float]] = None
         self._engine_episode_count: int = 0
 
-    def _motion_snapshot(self) -> Tuple[float, float, float]:
-        return (
-            float(self.game.get_game_variable(GameVariable.POSITION_X)),
-            float(self.game.get_game_variable(GameVariable.POSITION_Y)),
-            float(self.game.get_game_variable(GameVariable.ANGLE)),
+    def _motion_snapshot(self) -> MotionSnapshot:
+        return MotionSnapshot(
+            x=float(self.game.get_game_variable(GameVariable.POSITION_X)),
+            y=float(self.game.get_game_variable(GameVariable.POSITION_Y)),
+            angle_deg=float(self.game.get_game_variable(GameVariable.ANGLE)),
         )
-
-    @staticmethod
-    def _angle_delta_deg(before_deg: float, after_deg: float) -> float:
-        delta = (after_deg - before_deg + 180.0) % 360.0 - 180.0
-        return abs(delta)
-
-    def _wall_stuck_penalty(self, action_buttons: List[int], before: Tuple[float, float, float], after: Tuple[float, float, float]) -> float:
-        cfg = self.agent.reward.shaping
-        penalty = float(getattr(cfg, "wall_stuck_penalty", 0.0))
-        if penalty >= 0.0:
-            return 0.0
-
-        move_attempt = bool(action_buttons[0] or action_buttons[1] or action_buttons[2])
-        if not move_attempt:
-            return 0.0
-
-        dx = after[0] - before[0]
-        dy = after[1] - before[1]
-        dist = float((dx * dx + dy * dy) ** 0.5)
-        angle_delta = self._angle_delta_deg(before[2], after[2])
-
-        min_move = float(getattr(cfg, "wall_stuck_min_move", 1.0))
-        max_turn_deg = float(getattr(cfg, "wall_stuck_max_turn_deg", 5.0))
-
-        if dist < min_move and angle_delta < max_turn_deg:
-            return penalty
-        return 0.0
 
     def _show_agent_view_window(self, obs: np.ndarray) -> None:
         if not self._render_agent_view:
             return
         try:
             frame = np.asarray(obs)
-            if frame.ndim == 3 and frame.shape[2] == 1:
+            if frame.ndim == 3 and frame.shape[0] == 1:
+                frame = frame[0]
+            elif frame.ndim == 3 and frame.shape[2] == 1:
                 frame = frame[:, :, 0]
             frame = np.ascontiguousarray(frame, dtype=np.uint8)
             cv2.imshow(self._agent_view_window_name, frame)
@@ -384,51 +406,226 @@ class DoomDMEnv(gym.Env):
             print(f"[ENV][WARN] Falha ao desenhar host_agent view: {e!r}")
 
     # ----------------------------------------------------------------------
-    # Obs: SEMPRE (NET_H, NET_W, 1) uint8
+    # Obs: SEMPRE (1, NET_H, NET_W) uint8
     # ----------------------------------------------------------------------
-    def _read_obs(self) -> np.ndarray:
-        st = self.game.get_state()
+    def _read_obs(self, state: Optional[Any] = None) -> np.ndarray:
+        st = state if state is not None else self.game.get_state()
 
         if st is None or st.screen_buffer is None:
             if self._last_obs is not None:
                 return self._last_obs
-            obs = np.zeros((self.NET_H, self.NET_W, 1), dtype=np.uint8)
+            obs = np.zeros((1, self.NET_H, self.NET_W), dtype=np.uint8)
             self._last_obs = obs
             return obs
 
-        img = st.screen_buffer  # pode vir CHW/HWC/HW
+        img = st.screen_buffer
 
-        # Caso ideal (headless): GRAY8 + screen_resolution == NET => img 2D (H,W)
         if img.ndim == 2:
             gray = img
-
         elif img.ndim == 3:
-            # CHW -> HWC (quando vem CHW)
             if img.shape[0] in (1, 3) and (img.shape[1] != 1 and img.shape[2] != 1):
                 img = img.transpose(1, 2, 0)
 
             if img.shape[2] == 1:
                 gray = img[:, :, 0]
             elif img.shape[2] == 3:
-                # fallback (render True com RGB)
                 gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             else:
                 gray = img[:, :, 0]
-
         else:
             gray = np.zeros((self.NET_H, self.NET_W), dtype=np.uint8)
 
-        # Fallback: só resize se necessário (idealmente nunca acontece em render=False)
-        if gray.shape[0] != self.NET_H or gray.shape[1] != self.NET_W:
+        source_h, source_w = int(gray.shape[0]), int(gray.shape[1])
+        if source_h != self.NET_H or source_w != self.NET_W:
             gray = cv2.resize(gray, (self.NET_W, self.NET_H), interpolation=cv2.INTER_AREA)
 
-        obs = np.ascontiguousarray(gray, dtype=np.uint8)[..., None]  # (H,W,1)
+        gray = self._draw_enemy_outline(gray, st, source_w=source_w, source_h=source_h)
 
-        if obs.shape != (self.NET_H, self.NET_W, 1):
-            raise RuntimeError(f"[ENV] Obs inválida {obs.shape}, esperado {(self.NET_H, self.NET_W, 1)}")
+        obs = np.ascontiguousarray(gray[None, ...], dtype=np.uint8)
+
+        if obs.shape != (1, self.NET_H, self.NET_W):
+            raise RuntimeError(f"[ENV] Obs invalida {obs.shape}, esperado {(1, self.NET_H, self.NET_W)}")
 
         self._last_obs = obs
         return obs
+
+    def _draw_enemy_outline(
+        self,
+        gray: np.ndarray,
+        state: Optional[Any],
+        *,
+        source_w: int,
+        source_h: int,
+    ) -> np.ndarray:
+        if not bool(getattr(self.agent.render_settings, "enemy_outline", False)):
+            return gray
+        if state is None or not self._labels_enabled:
+            return gray
+
+        labels = getattr(state, "labels", None) or []
+        if not labels:
+            return gray
+
+        frame = np.ascontiguousarray(gray, dtype=np.uint8).copy()
+        value = int(max(0, min(255, int(getattr(self.agent.render_settings, "enemy_outline_value", 255)))))
+        thickness = max(1, int(getattr(self.agent.render_settings, "enemy_outline_thickness", 2)))
+        pattern = str(getattr(self.agent.render_settings, "enemy_outline_pattern", "solid")).strip().lower()
+        scale_x = float(self.NET_W) / max(1.0, float(source_w))
+        scale_y = float(self.NET_H) / max(1.0, float(source_h))
+
+        for label in labels:
+            category = str(getattr(label, "object_category", "") or "")
+            if category != "Player":
+                continue
+
+            x = int(round(float(getattr(label, "x", 0.0) or 0.0) * scale_x))
+            y = int(round(float(getattr(label, "y", 0.0) or 0.0) * scale_y))
+            w = int(round(float(getattr(label, "width", 0.0) or 0.0) * scale_x))
+            h = int(round(float(getattr(label, "height", 0.0) or 0.0) * scale_y))
+            if w <= 1 or h <= 1:
+                continue
+
+            x1 = max(0, min(self.NET_W - 1, x))
+            y1 = max(0, min(self.NET_H - 1, y))
+            x2 = max(0, min(self.NET_W - 1, x + w))
+            y2 = max(0, min(self.NET_H - 1, y + h))
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            if pattern == "checker":
+                self._draw_checker_rect(frame, x1, y1, x2, y2, thickness=thickness)
+            else:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color=value, thickness=thickness)
+
+        return frame
+
+    @staticmethod
+    def _draw_checker_rect(frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, *, thickness: int) -> None:
+        h, w = frame.shape[:2]
+        thickness = max(1, int(thickness))
+
+        for offset in range(thickness):
+            left = max(0, min(w - 1, x1 + offset))
+            right = max(0, min(w - 1, x2 - offset))
+            top = max(0, min(h - 1, y1 + offset))
+            bottom = max(0, min(h - 1, y2 - offset))
+            if right < left or bottom < top:
+                break
+
+            xs = np.arange(left, right + 1)
+            ys = np.arange(top, bottom + 1)
+
+            top_values = np.where(((xs + top) & 1) == 0, 255, 0).astype(np.uint8)
+            bottom_values = np.where(((xs + bottom) & 1) == 0, 255, 0).astype(np.uint8)
+            left_values = np.where(((left + ys) & 1) == 0, 255, 0).astype(np.uint8)
+            right_values = np.where(((right + ys) & 1) == 0, 255, 0).astype(np.uint8)
+
+            frame[top, left : right + 1] = top_values
+            frame[bottom, left : right + 1] = bottom_values
+            frame[top : bottom + 1, left] = left_values
+            frame[top : bottom + 1, right] = right_values
+
+    @staticmethod
+    def _clip01(value: float) -> float:
+        return float(max(0.0, min(1.0, value)))
+
+    @staticmethod
+    def _clip11(value: float) -> float:
+        return float(max(-1.0, min(1.0, value)))
+
+    def _state_vars_snapshot(self) -> Dict[str, float]:
+        g = self.game
+        vx = float(g.get_game_variable(GameVariable.VELOCITY_X))
+        vy = float(g.get_game_variable(GameVariable.VELOCITY_Y))
+        return {
+            "health": float(g.get_game_variable(GameVariable.HEALTH)),
+            "armor": float(g.get_game_variable(GameVariable.ARMOR)),
+            "ammo2": float(g.get_game_variable(GameVariable.AMMO2)),
+            "selected_weapon": float(g.get_game_variable(GameVariable.SELECTED_WEAPON)),
+            "selected_weapon_ammo": float(g.get_game_variable(GameVariable.SELECTED_WEAPON_AMMO)),
+            "damage": float(g.get_game_variable(GameVariable.DAMAGECOUNT)),
+            "frags": float(g.get_game_variable(GameVariable.FRAGCOUNT)),
+            "deaths": float(g.get_game_variable(GameVariable.DEATHCOUNT)),
+            "hits": float(g.get_game_variable(GameVariable.HITCOUNT)),
+            "hits_taken": float(g.get_game_variable(GameVariable.HITS_TAKEN)),
+            "vx": vx,
+            "vy": vy,
+            "vz": float(g.get_game_variable(GameVariable.VELOCITY_Z)),
+            "speed_xy": float((vx * vx + vy * vy) ** 0.5),
+        }
+
+    def _enemy_state_features(self, state: Optional[Any]) -> Tuple[float, float, float, float, float]:
+        if state is None or not self._labels_enabled:
+            return 0.0, 0.0, 0.5, 0.5, 0.0
+
+        labels = getattr(state, "labels", None) or []
+        enemies: List[Tuple[float, float, float, float, float]] = []
+        screen_area = max(1.0, float(self.NET_W * self.NET_H))
+        for label in labels:
+            category = str(getattr(label, "object_category", "") or "")
+            if category != "Player":
+                continue
+            x = float(getattr(label, "x", 0.0) or 0.0)
+            y = float(getattr(label, "y", 0.0) or 0.0)
+            w = max(0.0, float(getattr(label, "width", 0.0) or 0.0))
+            h = max(0.0, float(getattr(label, "height", 0.0) or 0.0))
+            area_ratio = self._clip01((w * h) / screen_area)
+            cx = self._clip01((x + w * 0.5) / max(1.0, float(self.NET_W)))
+            cy = self._clip01((y + h * 0.5) / max(1.0, float(self.NET_H)))
+            enemies.append((area_ratio, cx, cy, w, h))
+
+        if not enemies:
+            return 0.0, 0.0, 0.5, 0.5, 0.0
+
+        largest = max(enemies, key=lambda item: item[0])
+        visible = 1.0
+        count_norm = self._clip01(float(len(enemies)) / 8.0)
+        return visible, count_norm, largest[1], largest[2], largest[0]
+
+    def _read_state_vector(self, state: Optional[Any], *, update_last: bool) -> np.ndarray:
+        now = self._state_vars_snapshot()
+        prev = self._last_state_vars or now
+        enemy_visible, enemy_count, enemy_cx, enemy_cy, enemy_area = self._enemy_state_features(state)
+
+        damage_delta = max(0.0, now["damage"] - prev.get("damage", now["damage"]))
+        hit_delta = max(0.0, now["hits"] - prev.get("hits", now["hits"]))
+        hits_taken_delta = max(0.0, now["hits_taken"] - prev.get("hits_taken", now["hits_taken"]))
+        frag_delta = now["frags"] - prev.get("frags", now["frags"])
+        death_delta = max(0.0, now["deaths"] - prev.get("deaths", now["deaths"]))
+
+        vec = np.asarray(
+            [
+                self._clip01(now["health"] / 100.0),
+                self._clip01(now["armor"] / 100.0),
+                self._clip01(now["ammo2"] / 50.0),
+                self._clip01(now["selected_weapon"] / 10.0),
+                self._clip01(now["selected_weapon_ammo"] / 50.0),
+                self._clip01(now["speed_xy"] / 20.0),
+                self._clip11(now["vx"] / 20.0),
+                self._clip11(now["vy"] / 20.0),
+                self._clip01(damage_delta / 100.0),
+                self._clip01(hit_delta / 10.0),
+                self._clip01(hits_taken_delta / 10.0),
+                self._clip11(frag_delta),
+                self._clip01(death_delta),
+                enemy_visible,
+                enemy_count,
+                enemy_cx,
+                enemy_cy,
+                enemy_area,
+            ][: self.STATE_DIM],
+            dtype=np.float32,
+        )
+
+        if update_last:
+            self._last_state_vars = now
+        return vec
+
+    def _read_observation(self, state: Optional[Any] = None, *, update_state: bool = True) -> Dict[str, np.ndarray]:
+        return {
+            "image": self._read_obs(state),
+            "state": self._read_state_vector(state, update_last=update_state),
+        }
 
     # ----------------------------------------------------------------------
     # API Gymnasium
@@ -444,27 +641,30 @@ class DoomDMEnv(gym.Env):
 
         g = self.game
         if not g.is_running():
-            raise RuntimeError(f"[ENV] reset(): game não está rodando (is_host={self.is_host}, name={self.name})")
+            raise RuntimeError(f"[ENV] reset(): game nao esta rodando (is_host={self.is_host}, name={self.name})")
 
         if self._engine_episode_count == 0:
             self._engine_episode_count = 1
             print(
-                f"[ENV] reset(): usando episódio criado por init() "
+                f"[ENV] reset(): usando episodio criado por init() "
                 f"(engine_episode_count={self._engine_episode_count}, is_host={self.is_host}, name={self.name})"
             )
         else:
             print(
-                f"[ENV] reset(): reusando episódio existente "
+                f"[ENV] reset(): reusando episodio existente "
                 f"(engine_episode_count={self._engine_episode_count}, is_host={self.is_host}, name={self.name})"
             )
 
-        self.shaper.reset(g)
-        obs = self._read_obs()
-        self._show_agent_view_window(obs)
+        vars_snapshot = capture_vars(g)
+        self.shaper.reset(snapshot=vars_snapshot)
+        self.contextual_shaper.reset()
+        obs = self._read_observation(update_state=True)
+        self._show_agent_view_window(obs["image"])
 
         print(
-            f"[ENV] reset() concluído (is_host={self.is_host}, name={self.name}, "
-            f"engine_episode_count={self._engine_episode_count}, obs_shape={obs.shape})"
+            f"[ENV] reset() concluido (is_host={self.is_host}, name={self.name}, "
+            f"engine_episode_count={self._engine_episode_count}, "
+            f"image_shape={obs['image'].shape}, state_shape={obs['state'].shape})"
         )
         return obs, {"name": self.name}
 
@@ -474,11 +674,32 @@ class DoomDMEnv(gym.Env):
                 self.game.respawn_player()
 
             a = self._actions[int(action)].tolist()
-            motion_before = self._motion_snapshot()
+            wall_penalty_enabled = float(getattr(self.agent.reward.shaping, "wall_stuck_penalty", 0.0)) < 0.0
+            enemy_reward_enabled = self._labels_enabled and float(
+                getattr(self.agent.reward.shaping, "enemy_in_view_reward", 0.0)
+            ) > 0.0
+
+            motion_before = self._motion_snapshot() if wall_penalty_enabled else None
             engine_r = float(self.game.make_action(a, int(self.dm.frame_skip)))
-            shaped_r = self.shaper.compute(self.game, engine_r)
-            motion_after = self._motion_snapshot()
-            shaped_r += self._wall_stuck_penalty(a, motion_before, motion_after)
+            state_after_action = self.game.get_state() if self._labels_enabled else None
+            vars_snapshot: StepVarsSnapshot = capture_vars(self.game)
+            shaped_r = self.shaper.compute(self.game, engine_r, snapshot=vars_snapshot)
+            velocity_snapshot = self._state_vars_snapshot()
+            shaped_r += self.contextual_shaper.compute_velocity_reward(
+                speed_xy=velocity_snapshot["speed_xy"],
+                move_attempt=ContextualRewardShaper._move_attempt(a),
+            )
+
+            if wall_penalty_enabled and motion_before is not None:
+                motion_after = self._motion_snapshot()
+                shaped_r += self.contextual_shaper.compute_wall_stuck(a, motion_before, motion_after)
+
+            if enemy_reward_enabled:
+                shaped_r += self.contextual_shaper.compute_enemy_acquisition(
+                    state_after_action,
+                    screen_w=self.NET_W,
+                    screen_h=self.NET_H,
+                )
 
             if self.game.is_episode_finished():
                 print(
@@ -489,14 +710,16 @@ class DoomDMEnv(gym.Env):
                 self.game.new_episode()
                 self._engine_episode_count += 1
                 self.shaper.reset(self.game)
+                self.contextual_shaper.reset()
                 elapsed = time.monotonic() - t0
                 print(
                     f"[ENV][DEBUG] new_episode() OK em {elapsed:.3f}s "
                     f"(engine_episode_count={self._engine_episode_count}, is_host={self.is_host}, name={self.name})"
                 )
-
-            obs = self._read_obs()
-            self._show_agent_view_window(obs)
+                obs = self._read_observation(update_state=True)
+            else:
+                obs = self._read_observation(state_after_action, update_state=True)
+            self._show_agent_view_window(obs["image"])
 
             info: Dict[str, Any] = {
                 "engine_r": engine_r,
@@ -509,11 +732,10 @@ class DoomDMEnv(gym.Env):
 
         except Exception as e:
             print(
-                f"[ENV][ERROR] Exceção em step(action={action}) "
+                f"[ENV][ERROR] Excecao em step(action={action}) "
                 f"(is_host={self.is_host}, name={self.name}): {e!r}"
             )
             raise
-
     def render(self):
         pass
 

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Type
 import importlib
 
 import torch
+from gymnasium import spaces
 from stable_baselines3 import PPO, A2C, DQN
 from stable_baselines3.common.base_class import BaseAlgorithm
+
+from .ppo_cuda import CudaOptimizedPPO
+from .rollout_buffers import PinnedRolloutBuffer
 
 # ---------------------------------------------------------
 # Mapa de algoritmos suportados
@@ -17,6 +21,16 @@ AlgoMap = {
     "dqn": DQN,
 }
 
+_LEARNER_RUNTIME_KEYS = {
+    "use_pinned_rollout_buffer",
+    "use_cuda_optimized_ppo",
+    "use_amp",
+    "use_torch_compile",
+    "use_cudnn_benchmark",
+    "use_tf32",
+    "torch_matmul_precision",
+}
+
 
 def resolve_algo(algo_name: str):
     """
@@ -26,6 +40,15 @@ def resolve_algo(algo_name: str):
     if algo_name not in AlgoMap:
         raise ValueError(f"Algo '{algo_name}' não suportado.")
     return AlgoMap[algo_name]
+
+
+def resolve_effective_algo(algo_name: str, learn_kwargs: Optional[Dict[str, Any]] = None):
+    """Resolve the class used for load/create, including optional CUDA PPO."""
+    algo_cls = resolve_algo(algo_name)
+    lk = learn_kwargs or {}
+    if algo_name.lower() == "ppo" and bool(lk.get("use_cuda_optimized_ppo", False)):
+        return CudaOptimizedPPO
+    return algo_cls
 
 
 # ---------------------------------------------------------
@@ -122,6 +145,14 @@ def _coerce_learn_kwargs(learn_kwargs: Dict[str, Any]) -> Dict[str, Any]:
         "buffer_size",
         "n_envs",
     ]
+    bool_keys = [
+        "use_pinned_rollout_buffer",
+        "use_cuda_optimized_ppo",
+        "use_amp",
+        "use_torch_compile",
+        "use_cudnn_benchmark",
+        "use_tf32",
+    ]
 
     for k in float_keys:
         if k in lk and isinstance(lk[k], str):
@@ -129,8 +160,40 @@ def _coerce_learn_kwargs(learn_kwargs: Dict[str, Any]) -> Dict[str, Any]:
     for k in int_keys:
         if k in lk and isinstance(lk[k], str):
             lk[k] = int(lk[k])
+    for k in bool_keys:
+        if k in lk and isinstance(lk[k], str):
+            lk[k] = lk[k].strip().lower() in {"1", "true", "yes", "y", "on"}
 
     return lk
+
+
+def _extract_learner_runtime_kwargs(learn_kwargs: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    lk = dict(learn_kwargs)
+    runtime = {key: lk.pop(key) for key in list(lk.keys()) if key in _LEARNER_RUNTIME_KEYS}
+    return lk, runtime
+
+
+def _maybe_enable_cuda_learner(
+    algo_cls: Type[BaseAlgorithm],
+    learn_kwargs: Dict[str, Any],
+    runtime_kwargs: Dict[str, Any],
+    device: str,
+) -> tuple[Type[BaseAlgorithm], Dict[str, Any]]:
+    if algo_cls is PPO and bool(runtime_kwargs.get("use_cuda_optimized_ppo", False)):
+        algo_cls = CudaOptimizedPPO
+
+    if algo_cls is CudaOptimizedPPO:
+        learn_kwargs["use_amp"] = bool(runtime_kwargs.get("use_amp", False))
+        learn_kwargs["compile_evaluate_actions"] = bool(runtime_kwargs.get("use_torch_compile", False))
+
+    if algo_cls in {PPO, CudaOptimizedPPO} and bool(runtime_kwargs.get("use_pinned_rollout_buffer", False)):
+        learn_kwargs["rollout_buffer_class"] = PinnedRolloutBuffer
+        learn_kwargs["rollout_buffer_kwargs"] = {
+            **dict(learn_kwargs.get("rollout_buffer_kwargs") or {}),
+            "pin_memory_if_cuda": device == "cuda",
+        }
+
+    return algo_cls, learn_kwargs
 
 
 # ---------------------------------------------------------
@@ -163,6 +226,7 @@ def build_sb3(
 
     # normaliza tipos numéricos de learn_kwargs
     learn_kwargs = _coerce_learn_kwargs(learn_kwargs)
+    learn_kwargs, runtime_kwargs = _extract_learner_runtime_kwargs(learn_kwargs)
 
     # extrai range de LR, se houver
     lr_max = learn_kwargs.pop("learning_rate_max", None)
@@ -180,6 +244,29 @@ def build_sb3(
     use_cuda = torch.cuda.is_available()
     device = "cuda" if use_cuda else "cpu"
     print(f"[POLICY] device={device}, cuda_available={use_cuda}")
+
+    if isinstance(getattr(env, "observation_space", None), spaces.Dict):
+        if policy_str == "CnnPolicy":
+            policy_str = "MultiInputPolicy"
+            print("[POLICY] Observation Dict detectado; usando MultiInputPolicy.")
+        if bool(runtime_kwargs.get("use_pinned_rollout_buffer", False)):
+            runtime_kwargs["use_pinned_rollout_buffer"] = False
+            print("[POLICY][WARN] PinnedRolloutBuffer desativado para observation_space Dict.")
+
+    algo_cls, learn_kwargs = _maybe_enable_cuda_learner(
+        algo_cls,
+        learn_kwargs,
+        runtime_kwargs,
+        device,
+    )
+    if algo_cls is CudaOptimizedPPO:
+        print(
+            "[POLICY] CudaOptimizedPPO ativo "
+            f"(amp={bool(runtime_kwargs.get('use_amp', False))}, "
+            f"compile={bool(runtime_kwargs.get('use_torch_compile', False))})"
+        )
+    if learn_kwargs.get("rollout_buffer_class") is PinnedRolloutBuffer:
+        print("[POLICY] PinnedRolloutBuffer ativo para PPO.")
 
     model = algo_cls(
         policy_str,

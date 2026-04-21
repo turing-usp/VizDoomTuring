@@ -1,0 +1,22 @@
+cfg: "./stern_deathmatch.yaml"
+actors_per_match: 12
+render: "none"
+trainer_port: 7200
+port: 5200
+game_ip: "127.0.0.1"
+timelimit: 0.0
+stack: 4
+frame_skip: 9
+ticrate: 105
+host_start_delay: 1.5
+actor_start_delay: 0.02
+shm_obs: true
+warmstart_reset_steps: false
+
+matches:
+  - scenario: "multi_duel_dm15_smart.wad"
+    map: "map01"
+    count: 8
+  - scenario: "multi_duel_dm15.wad"
+    map: "map01"
+    count: 4

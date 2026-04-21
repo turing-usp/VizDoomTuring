@@ -3,20 +3,21 @@ import os
 
 from stable_baselines3.common.vec_env import (
     DummyVecEnv,
-    VecTransposeImage,
     VecFrameStack,
 )
+from gymnasium import spaces
 
-from .policies import resolve_algo, build_sb3, ExternalPolicyAdapter
+from .policies import resolve_effective_algo, build_sb3, ExternalPolicyAdapter
+from .runtime_cuda import configure_cuda_runtime
 
 
 def make_vec_env(env_fn: Callable, n_stack: int):
     """
-    Cria VecEnv de 1 ambiente (DummyVecEnv) + transpose + frame stack.
+    Cria VecEnv de 1 ambiente (DummyVecEnv) + frame stack.
     """
     env = DummyVecEnv([env_fn])
-    env = VecTransposeImage(env)  # HWC->CHW
-    env = VecFrameStack(env, n_stack=n_stack, channels_order="first")
+    channels_order = {"image": "first", "state": None} if isinstance(env.observation_space, spaces.Dict) else "first"
+    env = VecFrameStack(env, n_stack=n_stack, channels_order=channels_order)
     return env
 
 
@@ -73,7 +74,12 @@ def train_or_play(env_fn: Callable, n_stack: int, agent_cfg, save_path: str):
     # Caso SB3 (PPO / A2C / DQN)
     # ------------------------------------------------------------------
     else:
-        algo_cls = resolve_algo(algo_name)
+        configure_cuda_runtime(
+            benchmark=bool(agent_cfg.policy.learn_kwargs.get("use_cudnn_benchmark", True)),
+            tf32=bool(agent_cfg.policy.learn_kwargs.get("use_tf32", False)),
+            matmul_precision=str(agent_cfg.policy.learn_kwargs.get("torch_matmul_precision", "highest")),
+        )
+        algo_cls = resolve_effective_algo(algo_name, agent_cfg.policy.learn_kwargs)
         model = _load_or_create_sb3(algo_cls, env, agent_cfg, save_path)
 
         if agent_cfg.train:

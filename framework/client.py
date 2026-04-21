@@ -12,10 +12,12 @@ from .config import (
     DMConfig,
     AgentConfig,
     EngineRewardConfig,
+    EnemyInViewConfig,
     ShapingConfig,
     PolicyConfig,
     RewardConfig,
     RenderSettingsConfig,
+    WallStuckConfig,
 )
 from .env import DoomDMEnv
 from .train import train_or_play
@@ -52,11 +54,34 @@ def load_agent_cfg(yaml_path: str) -> AgentConfig:
     # Render Settings
     rs = RenderSettingsConfig(**y.get("render_settings", {}))
 
-    # Reward (engine + shaping)
+    # Reward (engine + shaping + tuning blocks)
     reward_block = y.get("reward", {})
     er = EngineRewardConfig(**reward_block.get("engine", {}))
-    sh = ShapingConfig(**reward_block.get("shaping", {}))
-    reward_cfg = RewardConfig(engine=er, shaping=sh)
+    shaping_raw = dict(reward_block.get("shaping", {}))
+
+    wall_stuck_raw = dict(reward_block.get("wall_stuck", {}))
+    if "wall_stuck_min_move" in shaping_raw and "min_move" not in wall_stuck_raw:
+        wall_stuck_raw["min_move"] = shaping_raw.pop("wall_stuck_min_move")
+    if "wall_stuck_max_turn_deg" in shaping_raw and "max_turn_deg" not in wall_stuck_raw:
+        wall_stuck_raw["max_turn_deg"] = shaping_raw.pop("wall_stuck_max_turn_deg")
+    if "wall_stuck_persist_steps" in shaping_raw and "persist_steps" not in wall_stuck_raw:
+        wall_stuck_raw["persist_steps"] = shaping_raw.pop("wall_stuck_persist_steps")
+
+    enemy_in_view_raw = dict(reward_block.get("enemy_in_view", {}))
+    if "enemy_in_view_check_every" in shaping_raw and "check_every" not in enemy_in_view_raw:
+        enemy_in_view_raw["check_every"] = shaping_raw.pop("enemy_in_view_check_every")
+    if "enemy_in_view_cooldown_steps" in shaping_raw and "cooldown_steps" not in enemy_in_view_raw:
+        enemy_in_view_raw["cooldown_steps"] = shaping_raw.pop("enemy_in_view_cooldown_steps")
+    if "enemy_in_view_min_area_ratio" in shaping_raw and "min_area_ratio" not in enemy_in_view_raw:
+        enemy_in_view_raw["min_area_ratio"] = shaping_raw.pop("enemy_in_view_min_area_ratio")
+
+    sh = ShapingConfig(**shaping_raw)
+    reward_cfg = RewardConfig(
+        engine=er,
+        shaping=sh,
+        wall_stuck=WallStuckConfig(**wall_stuck_raw),
+        enemy_in_view=EnemyInViewConfig(**enemy_in_view_raw),
+    )
 
     pol = PolicyConfig(**y.get("policy", {}))
 

@@ -4,11 +4,12 @@ from __future__ import annotations
 import argparse
 import collections
 import csv
+import math
 import os
 import subprocess
 import sys
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from multiprocessing.connection import Connection, Listener, wait
 from typing import Any, Dict, List, Set, Tuple, Optional
 
@@ -16,17 +17,21 @@ import numpy as np
 import torch
 from gymnasium import spaces
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import VecEnv, VecFrameStack, VecTransposeImage
+from stable_baselines3.common.vec_env import VecEnv, VecFrameStack
 
 from .client import load_agent_cfg
 from .config import AgentConfig
-from .policies import build_sb3, resolve_algo
+from .policies import build_sb3, resolve_effective_algo
+from .runtime_cuda import configure_cuda_runtime
 
 try:
     # Python 3.8+
     from multiprocessing.shared_memory import SharedMemory
 except Exception:  # pragma: no cover
     SharedMemory = None  # type: ignore
+
+
+LOG_LEVELS = {"quiet": 0, "normal": 1, "debug": 2}
 
 
 # ============================================================
@@ -104,16 +109,24 @@ class RemoteDMVecEnv(VecEnv):
         action_space: spaces.Space,
         *,
         shm_obs: bool = False,
+        log_level: str = "normal",
+        actor_metadata: Optional[List[Dict[str, Any]]] = None,
     ):
         if not conns:
             raise ValueError("É necessário pelo menos 1 conexão de ator")
 
         self._conns: List[Connection] = conns
+        self._conn_to_idx: Dict[Connection, int] = {conn: idx for idx, conn in enumerate(conns)}
         self._waiting: bool = False
         self.num_actors = len(conns)
+        self._log_level_name = log_level if log_level in LOG_LEVELS else "normal"
+        self._log_level = LOG_LEVELS[self._log_level_name]
+        self._actor_metadata = actor_metadata or [{} for _ in range(self.num_actors)]
 
         self._use_shm: bool = False
         self._shm: Optional[SharedObsManager] = None
+        self._shm_batch_buffers: List[np.ndarray] = []
+        self._shm_batch_buffer_cursor: int = 0
         self._step_async_started_at: Optional[float] = None
         self._last_reply_span_s: float = 0.0
         self._perf_last_log_at: float = time.time()
@@ -128,16 +141,63 @@ class RemoteDMVecEnv(VecEnv):
         self._perf_reply_span_max_s: float = 0.0
         self._perf_csv_path: Optional[str] = None
         self._perf_csv_header_written: bool = False
+        self._perf_csv_handle = None
+        self._perf_csv_writer: Optional[csv.DictWriter] = None
+        self._perf_csv_rows_since_flush: int = 0
+        self._perf_actor_latency_ms_total: Dict[int, float] = collections.defaultdict(float)
+        self._perf_actor_latency_count: Dict[int, int] = collections.defaultdict(int)
+        self._perf_actor_latency_max: Dict[int, float] = collections.defaultdict(float)
 
         super().__init__(
             num_envs=len(conns),
             observation_space=obs_space,
             action_space=action_space,
         )
-        print(f"[TRAIN] RemoteDMVecEnv criado com {self.num_envs} envs (jogadores).")
+        self._log("normal", f"[TRAIN] RemoteDMVecEnv criado com {self.num_envs} envs (jogadores).")
 
         if shm_obs:
             self._try_enable_shm_obs()
+
+    def _log(self, level: str, message: str, *, flush: bool = False) -> None:
+        if LOG_LEVELS.get(level, 1) <= self._log_level:
+            print(message, flush=flush)
+
+    def _open_perf_csv_writer(self) -> None:
+        if not self._perf_csv_path or self._perf_csv_handle is not None:
+            return
+        os.makedirs(os.path.dirname(self._perf_csv_path), exist_ok=True)
+        file_exists = os.path.exists(self._perf_csv_path)
+        self._perf_csv_handle = open(self._perf_csv_path, "a", newline="", encoding="utf-8")
+        self._perf_csv_writer = None
+        self._perf_csv_header_written = file_exists
+
+    def _write_perf_row(self, row: Dict[str, Any]) -> None:
+        if not self._perf_csv_path:
+            return
+        self._open_perf_csv_writer()
+        if self._perf_csv_handle is None:
+            return
+        if self._perf_csv_writer is None:
+            self._perf_csv_writer = csv.DictWriter(self._perf_csv_handle, fieldnames=list(row.keys()))
+            if not self._perf_csv_header_written:
+                self._perf_csv_writer.writeheader()
+                self._perf_csv_header_written = True
+        self._perf_csv_writer.writerow(row)
+        self._perf_csv_rows_since_flush += 1
+        if self._perf_csv_rows_since_flush >= 5:
+            self._perf_csv_handle.flush()
+            self._perf_csv_rows_since_flush = 0
+
+    def _next_shm_batch_buffer(self) -> np.ndarray:
+        if not self._shm_batch_buffers:
+            shape = (self.num_envs,) + tuple(self.observation_space.shape)
+            self._shm_batch_buffers = [
+                np.empty(shape, dtype=np.uint8),
+                np.empty(shape, dtype=np.uint8),
+            ]
+        buf = self._shm_batch_buffers[self._shm_batch_buffer_cursor]
+        self._shm_batch_buffer_cursor = 1 - self._shm_batch_buffer_cursor
+        return buf
 
     def _log_perf_window_if_due(self) -> None:
         now = time.time()
@@ -162,7 +222,8 @@ class RemoteDMVecEnv(VecEnv):
         if avg_batch_ms > 1000.0 or max_reply_span_ms > 3000.0:
             status = "critical"
 
-        print(
+        self._log(
+            "normal",
             f"[TRAIN][PERF][{status}] window={elapsed:.1f}s "
             f"vec_steps/s={vec_steps_per_s:.2f} env_steps/s={env_steps_per_s:.2f} "
             f"actor_decisions/s={vec_steps_per_s:.2f} "
@@ -170,32 +231,70 @@ class RemoteDMVecEnv(VecEnv):
             f"batch_ms(avg/max)={avg_batch_ms:.1f}/{max_batch_ms:.1f} "
             f"reply_span_ms(avg/max)={avg_reply_span_ms:.1f}/{max_reply_span_ms:.1f} "
             f"dones={self._perf_done_count}",
-            flush=True,
         )
 
-        if self._perf_csv_path:
-            os.makedirs(os.path.dirname(self._perf_csv_path), exist_ok=True)
-            row = {
-                "window_s": round(elapsed, 6),
-                "vec_steps_per_s": round(vec_steps_per_s, 6),
-                "env_steps_per_s": round(env_steps_per_s, 6),
-                "actor_decisions_per_s": round(vec_steps_per_s, 6),
-                "step_wait_ms_avg": round(avg_wait_ms, 6),
-                "step_wait_ms_max": round(max_wait_ms, 6),
-                "batch_ms_avg": round(avg_batch_ms, 6),
-                "batch_ms_max": round(max_batch_ms, 6),
-                "reply_span_ms_avg": round(avg_reply_span_ms, 6),
-                "reply_span_ms_max": round(max_reply_span_ms, 6),
-                "dones": int(self._perf_done_count),
-                "status": status,
-            }
-            write_header = (not self._perf_csv_header_written) and (not os.path.exists(self._perf_csv_path))
-            with open(self._perf_csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-                if write_header:
-                    writer.writeheader()
-                writer.writerow(row)
-            self._perf_csv_header_written = True
+        top_actor_idx = None
+        top_actor_avg_ms = 0.0
+        latency_avgs: List[float] = []
+        if self._perf_actor_latency_count:
+            latency_avgs = [
+                self._perf_actor_latency_ms_total[idx] / max(1, self._perf_actor_latency_count[idx])
+                for idx in self._perf_actor_latency_count
+            ]
+            top_actor_idx, top_actor_avg_ms = max(
+                (
+                    (idx, self._perf_actor_latency_ms_total[idx] / max(1, self._perf_actor_latency_count[idx]))
+                    for idx in self._perf_actor_latency_count
+                ),
+                key=lambda item: item[1],
+            )
+            meta = self._actor_metadata[top_actor_idx] if top_actor_idx < len(self._actor_metadata) else {}
+            self._log(
+                "normal",
+                "[TRAIN][STRAGGLER] "
+                f"actor={top_actor_idx} avg_latency_ms={top_actor_avg_ms:.1f} "
+                f"max_latency_ms={self._perf_actor_latency_max[top_actor_idx]:.1f} "
+                f"match={meta.get('match_idx', '?')} local={meta.get('local_idx', '?')} "
+                f"scenario={meta.get('scenario', '')!r} map={meta.get('map', '')!r}",
+            )
+            if latency_avgs:
+                p50 = float(np.percentile(latency_avgs, 50))
+                p95 = float(np.percentile(latency_avgs, 95))
+                p99 = float(np.percentile(latency_avgs, 99))
+                min_avg = max(1e-6, float(min(latency_avgs)))
+                hetero_ratio = float(max(latency_avgs) / min_avg)
+                self._log(
+                    "normal",
+                    f"[TRAIN][LATENCY] actors={len(latency_avgs)} avg_ms(p50/p95/p99)="
+                    f"{p50:.1f}/{p95:.1f}/{p99:.1f} hetero_ratio={hetero_ratio:.2f}",
+                )
+                if hetero_ratio >= 1.5:
+                    self._log(
+                        "normal",
+                        "[TRAIN][WARN] Mix de mapas/atores com latencia heterogenea detectado. "
+                        "Considere agrupar mapas de custo parecido para reduzir stragglers.",
+                    )
+
+        row = {
+            "window_s": round(elapsed, 6),
+            "vec_steps_per_s": round(vec_steps_per_s, 6),
+            "env_steps_per_s": round(env_steps_per_s, 6),
+            "actor_decisions_per_s": round(vec_steps_per_s, 6),
+            "step_wait_ms_avg": round(avg_wait_ms, 6),
+            "step_wait_ms_max": round(max_wait_ms, 6),
+            "batch_ms_avg": round(avg_batch_ms, 6),
+            "batch_ms_max": round(max_batch_ms, 6),
+            "reply_span_ms_avg": round(avg_reply_span_ms, 6),
+            "reply_span_ms_max": round(max_reply_span_ms, 6),
+            "dones": int(self._perf_done_count),
+            "status": status,
+            "straggler_actor_idx": top_actor_idx if top_actor_idx is not None else "",
+            "straggler_actor_avg_latency_ms": round(top_actor_avg_ms, 6) if top_actor_idx is not None else "",
+            "actor_latency_p50_ms": round(float(np.percentile(latency_avgs, 50)), 6) if latency_avgs else "",
+            "actor_latency_p95_ms": round(float(np.percentile(latency_avgs, 95)), 6) if latency_avgs else "",
+            "actor_latency_p99_ms": round(float(np.percentile(latency_avgs, 99)), 6) if latency_avgs else "",
+        }
+        self._write_perf_row(row)
 
         self._perf_last_log_at = now
         self._perf_step_calls = 0
@@ -207,9 +306,17 @@ class RemoteDMVecEnv(VecEnv):
         self._perf_batch_max_s = 0.0
         self._perf_reply_span_total_s = 0.0
         self._perf_reply_span_max_s = 0.0
+        self._perf_actor_latency_ms_total.clear()
+        self._perf_actor_latency_count.clear()
+        self._perf_actor_latency_max.clear()
 
     def set_perf_csv_path(self, perf_csv_path: str) -> None:
         self._perf_csv_path = perf_csv_path
+
+    def _record_actor_latency(self, idx: int, latency_ms: float) -> None:
+        self._perf_actor_latency_ms_total[idx] += latency_ms
+        self._perf_actor_latency_count[idx] += 1
+        self._perf_actor_latency_max[idx] = max(self._perf_actor_latency_max[idx], latency_ms)
 
     def _wait_for_replies(
         self,
@@ -220,7 +327,6 @@ class RemoteDMVecEnv(VecEnv):
         results: Dict[int, Any] = {}
         t0 = time.time()
         last_log = time.time()
-        conn_map = {self._conns[i]: i for i in pendentes}
         max_wait_handles = 60
         first_reply_at: Optional[float] = None
         last_reply_at: Optional[float] = None
@@ -231,11 +337,23 @@ class RemoteDMVecEnv(VecEnv):
 
             ready: List[Connection] = []
             deadline = time.time() + timeout
+            start_chunk = 0
+            idle_sleep_s = 0.001
 
             while True:
-                for start in range(0, len(conns), max_wait_handles):
+                num_chunks = (len(conns) + max_wait_handles - 1) // max_wait_handles
+                for chunk_idx in range(num_chunks):
+                    start = ((start_chunk + chunk_idx) % num_chunks) * max_wait_handles
                     batch = conns[start:start + max_wait_handles]
-                    ready.extend(wait(batch, timeout=0.0))
+                    if not batch:
+                        continue
+                    subtimeout = min(idle_sleep_s, max(0.0, deadline - time.time()))
+                    if subtimeout <= 0.0:
+                        return ready
+                    batch_ready = wait(batch, timeout=subtimeout)
+                    if batch_ready:
+                        ready.extend(batch_ready)
+                start_chunk = (start_chunk + 1) % max(1, num_chunks)
 
                 if ready:
                     return ready
@@ -243,7 +361,19 @@ class RemoteDMVecEnv(VecEnv):
                 if time.time() >= deadline:
                     return []
 
-                time.sleep(0.01)
+                idle_sleep_s = min(idle_sleep_s * 2.0, 0.005)
+
+        def recv_single(idx: int, single_timeout_total: float) -> Any:
+            conn = self._conns[idx]
+            deadline = time.time() + single_timeout_total
+            while True:
+                if conn.poll(0.01):
+                    return conn.recv()
+                if time.time() >= deadline:
+                    raise TimeoutError(
+                        f"[TRAIN] TIMEOUT CRÍTICO ({single_timeout_total}s) em {context}. "
+                        f"Ator que não respondeu: {idx}."
+                    )
 
         while pendentes:
             if time.time() - t0 > timeout_total:
@@ -252,29 +382,37 @@ class RemoteDMVecEnv(VecEnv):
                     f"Atores que não responderam: {sorted(list(pendentes))}."
                 )
 
-            if time.time() - last_log > 5.0:
-                print(
+            if self._log_level >= LOG_LEVELS["debug"] and time.time() - last_log > 5.0:
+                self._log(
+                    "debug",
                     f"[TRAIN][DEBUG] {context}: aguardando {len(pendentes)} atores: {list(pendentes)[:5]}...",
-                    flush=True,
                 )
                 last_log = time.time()
 
-            conns_to_wait = [self._conns[i] for i in pendentes]
-            ready_conns = wait_chunked(conns_to_wait, timeout=0.1)
+            if len(pendentes) == 1:
+                idx = next(iter(pendentes))
+                ready_msgs = [(self._conns[idx], recv_single(idx, timeout_total))]
+            else:
+                ready_msgs = []
+                conns_to_wait = [self._conns[i] for i in sorted(pendentes)]
+                ready_conns = wait_chunked(conns_to_wait, timeout=0.1)
+                for conn in ready_conns:
+                    ready_msgs.append((conn, conn.recv()))
 
-            for conn in ready_conns:
-                idx = conn_map.get(conn)
+            for conn, msg in ready_msgs:
+                idx = self._conn_to_idx.get(conn)
                 if idx is None or idx not in pendentes:
                     continue
 
                 try:
-                    msg = conn.recv()
                     if isinstance(msg, dict) and "error" in msg:
                         raise RuntimeError(f"[TRAIN] Ator {idx} reportou erro: {msg['error']}")
                     now = time.time()
                     if first_reply_at is None:
                         first_reply_at = now
                     last_reply_at = now
+                    latency_ms = max(0.0, (now - t0) * 1000.0)
+                    self._record_actor_latency(idx, latency_ms)
                     results[idx] = msg
                     pendentes.remove(idx)
                 except EOFError:
@@ -298,18 +436,18 @@ class RemoteDMVecEnv(VecEnv):
         faz fallback para IPC normal sem quebrar.
         """
         if SharedMemory is None:
-            print("[TRAIN][WARN] --shm-obs solicitado, mas SharedMemory não disponível. Ignorando.")
+            self._log("normal", "[TRAIN][WARN] --shm-obs solicitado, mas SharedMemory nao disponivel. Ignorando.")
             return
 
         if not isinstance(self.observation_space, spaces.Box):
-            print("[TRAIN][WARN] --shm-obs requer observation_space Box. Ignorando.")
+            self._log("normal", "[TRAIN][WARN] --shm-obs requer observation_space Box. Ignorando.")
             return
 
         obs_shape = tuple(int(x) for x in self.observation_space.shape)
         obs_dtype = np.dtype(self.observation_space.dtype)
 
         if obs_dtype != np.uint8:
-            print(f"[TRAIN][WARN] --shm-obs requer obs uint8. Obs dtype={obs_dtype}. Ignorando.")
+            self._log("normal", f"[TRAIN][WARN] --shm-obs requer obs uint8. Obs dtype={obs_dtype}. Ignorando.")
             return
 
         shm: Optional[SharedObsManager] = None
@@ -349,10 +487,10 @@ class RemoteDMVecEnv(VecEnv):
 
             self._shm = shm
             self._use_shm = True
-            print("[TRAIN] SHM obs habilitado: observações serão lidas via shared memory.")
+            self._log("normal", "[TRAIN] SHM obs habilitado: observacoes serao lidas via shared memory.")
 
         except Exception as e:
-            print(f"[TRAIN][WARN] Falha ao habilitar SHM obs, fallback para IPC normal: {e!r}")
+            self._log("normal", f"[TRAIN][WARN] Falha ao habilitar SHM obs, fallback para IPC normal: {e!r}")
             try:
                 if shm is not None:
                     shm.close()
@@ -361,13 +499,31 @@ class RemoteDMVecEnv(VecEnv):
             self._shm = None
             self._use_shm = False
 
-    def _read_obs_from_shm(self, idx: int) -> np.ndarray:
+    def _copy_obs_from_shm(self, idx: int, dest: np.ndarray) -> np.ndarray:
         assert self._shm is not None
-        # Copia para evitar ser sobrescrito pelo próximo step/reset
-        return np.array(self._shm.views[idx], copy=True)
+        np.copyto(dest, self._shm.views[idx], casting="no")
+        return dest
+
+    def _stack_obs_list(self, obs_list: List[Any]) -> Any:
+        if isinstance(self.observation_space, spaces.Dict):
+            stacked: Dict[str, Any] = {}
+            for key in self.observation_space.spaces.keys():
+                values = [obs[key] for obs in obs_list]
+                shapes = [np.asarray(value).shape for value in values]
+                if len(set(shapes)) != 1:
+                    raise RuntimeError(
+                        f"[TRAIN] Inconsistent obs shapes for key={key!r}: {list(enumerate(shapes))}"
+                    )
+                stacked[key] = np.stack(values, axis=0)
+            return stacked
+
+        shapes = [np.asarray(o).shape for o in obs_list]
+        if len(set(shapes)) != 1:
+            raise RuntimeError(f"[TRAIN] Inconsistent obs shapes: {list(enumerate(shapes))}")
+        return np.stack(obs_list, axis=0)
 
     def reset(self) -> np.ndarray:
-        print(f"[TRAIN] Enviando comando 'reset' para {self.num_envs} atores...", flush=True)
+        self._log("debug", f"[TRAIN] Enviando comando 'reset' para {self.num_envs} atores...", flush=True)
         for idx, conn in enumerate(self._conns):
             try:
                 conn.send({"cmd": "reset"})
@@ -383,11 +539,10 @@ class RemoteDMVecEnv(VecEnv):
 
         # Monta batch
         if self._use_shm:
-            obs_shape = self.observation_space.shape
-            obs_batch = np.empty((self.num_envs,) + obs_shape, dtype=np.uint8)
+            obs_batch = self._next_shm_batch_buffer()
             for i in range(self.num_envs):
-                obs_batch[i] = self._read_obs_from_shm(i)
-            print(f"[TRAIN] reset() concluído (SHM). Shape={obs_batch.shape}", flush=True)
+                self._copy_obs_from_shm(i, obs_batch[i])
+            self._log("debug", f"[TRAIN] reset() concluido (SHM). Shape={obs_batch.shape}", flush=True)
             return obs_batch
 
         obs_list: List[Any] = []
@@ -397,12 +552,8 @@ class RemoteDMVecEnv(VecEnv):
                 raise RuntimeError(f"[TRAIN] Resposta inválida reset ator {idx}: {msg!r}")
             obs_list.append(msg["obs"])
 
-        shapes = [np.asarray(o).shape for o in obs_list]
-        if len(set(shapes)) != 1:
-            raise RuntimeError(f"[TRAIN] Inconsistent obs shapes from actors: {list(enumerate(shapes))}")
-
-        obs_batch = np.stack(obs_list, axis=0)
-        print(f"[TRAIN] reset() concluído (IPC). Shape={obs_batch.shape}", flush=True)
+        obs_batch = self._stack_obs_list(obs_list)
+        self._log("debug", f"[TRAIN] reset() concluido (IPC).", flush=True)
         return obs_batch
 
     def step_async(self, actions):
@@ -431,9 +582,8 @@ class RemoteDMVecEnv(VecEnv):
             else wait_elapsed_s
         )
 
-        obs_shape = self.observation_space.shape
         if self._use_shm:
-            obs_batch = np.empty((self.num_envs,) + obs_shape, dtype=np.uint8)
+            obs_batch = self._next_shm_batch_buffer()
         else:
             obs_list: List[Any] = []
 
@@ -451,7 +601,7 @@ class RemoteDMVecEnv(VecEnv):
             info = dict(msg.get("info", {}))
 
             if self._use_shm:
-                obs = self._read_obs_from_shm(idx)
+                obs = self._copy_obs_from_shm(idx, obs_batch[idx])
             else:
                 obs = msg["obs"]
 
@@ -467,15 +617,13 @@ class RemoteDMVecEnv(VecEnv):
                         context=f"reset_pos_done({idx})",
                     )
                     if self._use_shm:
-                        obs = self._read_obs_from_shm(idx)
+                        obs = self._copy_obs_from_shm(idx, obs_batch[idx])
                     else:
                         obs = res[idx]["obs"]
                 except Exception as e:
                     raise RuntimeError(f"[TRAIN] Erro no reset automático do ator {idx}: {e!r}")
 
-            if self._use_shm:
-                obs_batch[idx] = obs
-            else:
+            if not self._use_shm:
                 obs_list.append(obs)
 
             rewards[idx] = rew
@@ -496,14 +644,10 @@ class RemoteDMVecEnv(VecEnv):
         if self._use_shm:
             return obs_batch, rewards, dones, infos
 
-        shapes = [np.asarray(o).shape for o in obs_list]
-        if len(set(shapes)) != 1:
-            raise RuntimeError(f"[TRAIN] Inconsistent obs shapes in step_wait: {list(enumerate(shapes))}")
-
-        return np.stack(obs_list, axis=0), rewards, dones, infos
+        return self._stack_obs_list(obs_list), rewards, dones, infos
 
     def close(self):
-        print("[TRAIN] Fechando RemoteDMVecEnv, enviando 'close' para atores...")
+        self._log("normal", "[TRAIN] Fechando RemoteDMVecEnv, enviando 'close' para atores...")
         if self._waiting:
             for conn in self._conns:
                 try:
@@ -533,6 +677,19 @@ class RemoteDMVecEnv(VecEnv):
             self._shm = None
             self._use_shm = False
 
+        if self._perf_csv_handle is not None:
+            try:
+                self._perf_csv_handle.flush()
+            except Exception:
+                pass
+            try:
+                self._perf_csv_handle.close()
+            except Exception:
+                pass
+            self._perf_csv_handle = None
+            self._perf_csv_writer = None
+            self._perf_csv_rows_since_flush = 0
+
     def render(self, mode: str = "human"):
         return None
 
@@ -549,49 +706,118 @@ class RemoteDMVecEnv(VecEnv):
         pass
 
 
-# ============================================================
-# Debug callback
-# ============================================================
-
 class DebugCallback(BaseCallback):
     def __init__(
         self,
         log_every: int = 1_000,
         reward_window: int = 10_000,
         metrics_csv_path: Optional[str] = None,
+        log_level: str = "normal",
         verbose: int = 0,
     ):
         super().__init__(verbose)
         self.log_every = log_every
         self.reward_window = reward_window
         self.metrics_csv_path = metrics_csv_path
+        self.log_level_name = log_level if log_level in LOG_LEVELS else "normal"
+        self.log_level = LOG_LEVELS[self.log_level_name]
         self._last = 0
         self._recent_rewards = collections.deque(maxlen=reward_window)
         self._rollout_start_time: float | None = None
         self._train_started_at: float | None = None
         self._csv_header_written: bool = False
+        self._csv_handle = None
+        self._csv_writer: Optional[csv.DictWriter] = None
+        self._csv_rows_since_flush = 0
+
+    def _log(self, level: str, message: str, *, flush: bool = False) -> None:
+        if LOG_LEVELS.get(level, 1) <= self.log_level:
+            print(message, flush=flush)
+
+    def _read_metrics_csv_header(self) -> List[str]:
+        if not self.metrics_csv_path or not os.path.exists(self.metrics_csv_path):
+            return []
+        try:
+            with open(self.metrics_csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                try:
+                    header = next(reader)
+                except StopIteration:
+                    return []
+                return list(header)
+        except Exception:
+            return []
+
+    def _rewrite_metrics_csv(self, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
+        if not self.metrics_csv_path:
+            return
+
+        if self._csv_handle is not None:
+            try:
+                self._csv_handle.flush()
+            except Exception:
+                pass
+            try:
+                self._csv_handle.close()
+            except Exception:
+                pass
+            self._csv_handle = None
+            self._csv_writer = None
+            self._csv_rows_since_flush = 0
+
+        os.makedirs(os.path.dirname(self.metrics_csv_path), exist_ok=True)
+        with open(self.metrics_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for existing_row in rows:
+                writer.writerow({field: existing_row.get(field, "") for field in fieldnames})
 
     def _append_metrics_row(self, row: Dict[str, Any]) -> None:
         if not self.metrics_csv_path:
             return
 
+        row_fields = list(row.keys())
+        existing_header = self._read_metrics_csv_header()
+        merged_header = list(existing_header)
+        for field in row_fields:
+            if field not in merged_header:
+                merged_header.append(field)
+
         os.makedirs(os.path.dirname(self.metrics_csv_path), exist_ok=True)
-        fieldnames = list(row.keys())
-        write_header = (not self._csv_header_written) and (not os.path.exists(self.metrics_csv_path))
-        with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if write_header:
+
+        if not existing_header:
+            with open(self.metrics_csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=merged_header)
                 writer.writeheader()
-            writer.writerow(row)
+                writer.writerow({field: row.get(field, "") for field in merged_header})
+            self._csv_header_written = True
+            return
+
+        if merged_header != existing_header:
+            with open(self.metrics_csv_path, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_rows = [dict(existing_row) for existing_row in reader]
+            existing_rows.append(dict(row))
+            self._rewrite_metrics_csv(merged_header, existing_rows)
+            self._csv_header_written = True
+            return
+
+        with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=existing_header)
+            writer.writerow({field: row.get(field, "") for field in existing_header})
+
         self._csv_header_written = True
+
+    def record_chunk_metrics(self, row: Dict[str, Any]) -> None:
+        self._append_metrics_row(row)
 
     def _on_training_start(self) -> None:
         self._train_started_at = time.time()
-        print("[DEBUG] == TRAINING START ==")
+        self._log("debug", "[DEBUG] == TRAINING START ==")
 
     def _on_rollout_start(self) -> None:
         self._rollout_start_time = time.time()
-        print(f"[DEBUG] ==== ROLLOUT START (num_timesteps={self.num_timesteps}) ====")
+        self._log("debug", f"[DEBUG] ==== ROLLOUT START (num_timesteps={self.num_timesteps}) ====")
 
     def _on_rollout_end(self) -> None:
         now = time.time()
@@ -611,9 +837,10 @@ class DebugCallback(BaseCallback):
             else float("nan")
         )
 
-        print(
+        self._log(
+            "normal",
             f"[DEBUG] ==== ROLLOUT END (num_timesteps={self.num_timesteps}) "
-            + (f"duracao={dt:.2f}s" if dt is not None else "")
+            + (f"duracao={dt:.2f}s" if dt is not None else ""),
         )
 
         row: Dict[str, Any] = {
@@ -631,6 +858,11 @@ class DebugCallback(BaseCallback):
             "train_clip_fraction": logger_values.get("train/clip_fraction", ""),
             "train_explained_variance": logger_values.get("train/explained_variance", ""),
             "train_std": logger_values.get("train/std", ""),
+            "train_cuda_train_time_s": logger_values.get("train/cuda_train_time_s", ""),
+            "train_cuda_minibatch_time_ms": logger_values.get("train/cuda_minibatch_time_ms", ""),
+            "train_cuda_minibatches": logger_values.get("train/cuda_minibatches", ""),
+            "train_cuda_memory_allocated_mb": logger_values.get("train/cuda_memory_allocated_mb", ""),
+            "train_cuda_memory_reserved_mb": logger_values.get("train/cuda_memory_reserved_mb", ""),
             "rollout_ep_rew_mean": logger_values.get("rollout/ep_rew_mean", ""),
             "rollout_ep_len_mean": logger_values.get("rollout/ep_len_mean", ""),
             "time_fps_logger": logger_values.get("time/fps", ""),
@@ -640,7 +872,19 @@ class DebugCallback(BaseCallback):
         self._append_metrics_row(row)
 
     def _on_training_end(self) -> None:
-        print("[DEBUG] == TRAINING END ==")
+        self._log("debug", "[DEBUG] == TRAINING END ==")
+        if self._csv_handle is not None:
+            try:
+                self._csv_handle.flush()
+            except Exception:
+                pass
+            try:
+                self._csv_handle.close()
+            except Exception:
+                pass
+            self._csv_handle = None
+            self._csv_writer = None
+            self._csv_rows_since_flush = 0
 
     def _on_step(self) -> bool:
         rewards = self.locals.get("rewards", None)
@@ -651,9 +895,10 @@ class DebugCallback(BaseCallback):
         if self.num_timesteps - self._last >= self.log_every:
             self._last = self.num_timesteps
             mean_r = float(sum(self._recent_rewards) / len(self._recent_rewards)) if self._recent_rewards else float("nan")
-            print(
+            self._log(
+                "debug",
                 f"[DEBUG] num_timesteps={self.num_timesteps}, "
-                f"mean_reward_window={mean_r:.3f} (últimos {len(self._recent_rewards)} passos)"
+                f"mean_reward_window={mean_r:.3f} (ultimos {len(self._recent_rewards)} passos)",
             )
         return True
 
@@ -661,6 +906,73 @@ class DebugCallback(BaseCallback):
 # ============================================================
 # CLI / orchestration
 # ============================================================
+
+
+@dataclass(frozen=True)
+class MatchPlanEntry:
+    scenario: Optional[str]
+    map_name: str
+    count: int
+    wad: Optional[str] = None
+
+
+def parse_match_spec(spec: str) -> MatchPlanEntry:
+    parts = [part.strip() for part in str(spec).split("|")]
+    if len(parts) not in (3, 4):
+        raise ValueError(
+            f"Formato invalido para --match '{spec}'. "
+            "Use: SCENARIO|MAP|COUNT ou SCENARIO|MAP|COUNT|WAD"
+        )
+
+    scenario = parts[0] or None
+    map_name = parts[1]
+    count_str = parts[2]
+    wad = parts[3] or None if len(parts) == 4 else None
+
+    if not map_name:
+        raise ValueError(f"MAP vazio em --match '{spec}'.")
+
+    try:
+        count = int(count_str)
+    except ValueError as e:
+        raise ValueError(f"COUNT invalido em --match '{spec}' (esperado int).") from e
+
+    if count <= 0:
+        raise ValueError(f"COUNT deve ser > 0 em --match '{spec}'.")
+
+    return MatchPlanEntry(
+        scenario=scenario,
+        map_name=map_name,
+        count=count,
+        wad=wad,
+    )
+
+
+def expand_match_plan(args: argparse.Namespace) -> List[MatchPlanEntry]:
+    if not getattr(args, "match", None):
+        return [
+            MatchPlanEntry(
+                scenario=args.scenario,
+                map_name=args.map,
+                count=1,
+                wad=args.wad,
+            )
+            for _ in range(int(args.num_matches))
+        ]
+
+    plan: List[MatchPlanEntry] = []
+    for raw_spec in args.match:
+        spec = parse_match_spec(raw_spec)
+        for _ in range(spec.count):
+            plan.append(
+                MatchPlanEntry(
+                    scenario=spec.scenario,
+                    map_name=spec.map_name,
+                    count=1,
+                    wad=spec.wad,
+                )
+            )
+    return plan
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Treinador distribuído VizDoom DM")
@@ -678,6 +990,11 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--map", default="map01", help="Nome do mapa (ex: MAP01 / map01)")
     parser.add_argument("--scenario", default=None, help="Cenário base .cfg/.wad/.pk3")
+    parser.add_argument(
+        "--match",
+        action="append",
+        help="Mistura de partidas: SCENARIO|MAP|COUNT ou SCENARIO|MAP|COUNT|WAD. Pode repetir.",
+    )
     parser.add_argument("--wad", default=None, help="Arquivo WAD/PK3 (nome em framework/maps ou caminho)")
     parser.add_argument("--frame-skip", type=int, default=8)
     parser.add_argument("--ticrate", type=int, default=30)
@@ -698,6 +1015,28 @@ def parse_args() -> argparse.Namespace:
         "--warmstart-reset-steps",
         action="store_true",
         help="Carrega pesos do checkpoint, mas reinicia steps/schedules/otimizador do zero.",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=tuple(LOG_LEVELS.keys()),
+        default="normal",
+        help="Volume de logs do trainer distribuido.",
+    )
+    parser.add_argument(
+        "--progress-bar",
+        action="store_true",
+        help="Habilita a barra de progresso do SB3 durante o treino.",
+    )
+    parser.add_argument(
+        "--play",
+        action="store_true",
+        help="Carrega o modelo e roda inferencia, sem treinar nem salvar.",
+    )
+    parser.add_argument(
+        "--play-steps",
+        type=int,
+        default=0,
+        help="Quantidade de decisoes no modo --play (0 = ate Ctrl+C).",
     )
 
     return parser.parse_args()
@@ -724,6 +1063,20 @@ def log_torch_device_info() -> None:
 
 
 def normalize_topology(args: argparse.Namespace) -> None:
+    if getattr(args, "match", None):
+        planned_matches = sum(parse_match_spec(spec).count for spec in args.match)
+        if args.num_matches is not None and int(args.num_matches) != planned_matches:
+            raise ValueError(
+                f"--num-matches={args.num_matches} conflita com a soma dos --match ({planned_matches})."
+            )
+        args.num_matches = planned_matches
+        if args.actors_per_match is None:
+            args.actors_per_match = args.num_actors
+        args.num_actors = args.num_matches * args.actors_per_match
+        print(f"[TRAIN] Config multi-mapa: {args.num_matches} partidas x {args.actors_per_match} jogadores.")
+        print(f"[TRAIN] Total atores calculados: {args.num_actors}")
+        return
+
     if args.num_matches is not None and args.actors_per_match is not None:
         print(f"[TRAIN] Config manual: {args.num_matches} partidas x {args.actors_per_match} jogadores.")
         args.num_actors = args.num_matches * args.actors_per_match
@@ -751,6 +1104,7 @@ def _build_actor_cmd(
     port: int,
     is_host: bool,
     players: int,
+    match_entry: MatchPlanEntry,
 ) -> List[str]:
     cmd = [
         sys.executable,
@@ -773,17 +1127,17 @@ def _build_actor_cmd(
         "--auth-key",
         args.auth_key,
         "--map",
-        str(args.map),
+        str(match_entry.map_name),
         "--frame-skip",
         str(args.frame_skip),
         "--ticrate",
         str(args.ticrate),
     ]
 
-    if args.scenario:
-        cmd += ["--scenario", str(args.scenario)]
-    if args.wad:
-        cmd += ["--wad", str(args.wad)]
+    if match_entry.scenario:
+        cmd += ["--scenario", str(match_entry.scenario)]
+    if match_entry.wad:
+        cmd += ["--wad", str(match_entry.wad)]
 
     if is_host:
         cmd.append("--is-host")
@@ -798,9 +1152,10 @@ def _build_actor_cmd(
 
 
 def launch_actors(args: argparse.Namespace, cfg_path: str) -> List[subprocess.Popen]:
-    num_matches = args.num_matches
     actors_per_match = args.actors_per_match
     procs: List[subprocess.Popen] = []
+    match_plan = expand_match_plan(args)
+    num_matches = len(match_plan)
 
     module_name = "framework.distributed_actor"
 
@@ -838,6 +1193,8 @@ def launch_actors_staggered(args: argparse.Namespace, cfg_path: str) -> List[sub
     num_matches = args.num_matches
     actors_per_match = args.actors_per_match
     procs: List[subprocess.Popen] = []
+    match_plan = expand_match_plan(args)
+    num_matches = len(match_plan)
 
     module_name = "framework.distributed_actor"
     spawn_delay_actor = max(0.0, float(args.actor_start_delay))
@@ -849,7 +1206,9 @@ def launch_actors_staggered(args: argparse.Namespace, cfg_path: str) -> List[sub
         match_port = args.game_port + match_idx
         print(f"\n[TRAIN] === Partida {match_idx} (Porta {match_port}) ===")
 
-        cmd_host = _build_actor_cmd(args, module_name, cfg_path, match_port, True, actors_per_match)
+        cmd_host = _build_actor_cmd(
+            args, module_name, cfg_path, match_port, True, actors_per_match, match_plan[match_idx]
+        )
         print("[TRAIN] LanÃ§ando HOST...")
         print("[TRAIN][CMD-HOST]", " ".join(cmd_host))
         procs.append(subprocess.Popen(cmd_host))
@@ -859,7 +1218,9 @@ def launch_actors_staggered(args: argparse.Namespace, cfg_path: str) -> List[sub
             time.sleep(spawn_delay_host)
 
         for local_idx in range(1, actors_per_match):
-            cmd_client = _build_actor_cmd(args, module_name, cfg_path, match_port, False, actors_per_match)
+            cmd_client = _build_actor_cmd(
+                args, module_name, cfg_path, match_port, False, actors_per_match, match_plan[match_idx]
+            )
             print(f"[TRAIN] LanÃ§ando Cliente {local_idx} da partida {match_idx}...")
             print("[TRAIN][CMD-CLI]", " ".join(cmd_client))
             procs.append(subprocess.Popen(cmd_client))
@@ -892,6 +1253,8 @@ def launch_actors_staggered_and_accept(
     actors_per_match = args.actors_per_match
     procs: List[subprocess.Popen] = []
     conns: List[Connection] = []
+    match_plan = expand_match_plan(args)
+    num_matches = len(match_plan)
 
     module_name = "framework.distributed_actor"
     spawn_delay_actor = max(0.0, float(args.actor_start_delay))
@@ -903,8 +1266,14 @@ def launch_actors_staggered_and_accept(
         match_port = args.game_port + match_idx
         label = f"partida {match_idx}"
         print(f"\n[TRAIN] === Partida {match_idx} (Porta {match_port}) ===")
+        print(
+            f"[TRAIN] Match config: scenario={match_plan[match_idx].scenario!r} "
+            f"map={match_plan[match_idx].map_name!r} wad={match_plan[match_idx].wad!r}"
+        )
 
-        cmd_host = _build_actor_cmd(args, module_name, cfg_path, match_port, True, actors_per_match)
+        cmd_host = _build_actor_cmd(
+            args, module_name, cfg_path, match_port, True, actors_per_match, match_plan[match_idx]
+        )
         print("[TRAIN] LanÃ§ando HOST...")
         print("[TRAIN][CMD-HOST]", " ".join(cmd_host))
         procs.append(subprocess.Popen(cmd_host))
@@ -914,7 +1283,9 @@ def launch_actors_staggered_and_accept(
             time.sleep(spawn_delay_host)
 
         for local_idx in range(1, actors_per_match):
-            cmd_client = _build_actor_cmd(args, module_name, cfg_path, match_port, False, actors_per_match)
+            cmd_client = _build_actor_cmd(
+                args, module_name, cfg_path, match_port, False, actors_per_match, match_plan[match_idx]
+            )
             print(f"[TRAIN] LanÃ§ando Cliente {local_idx} da partida {match_idx}...")
             print("[TRAIN][CMD-CLI]", " ".join(cmd_client))
             procs.append(subprocess.Popen(cmd_client))
@@ -948,11 +1319,43 @@ def fetch_spaces(conns: List[Connection]) -> Tuple[spaces.Space, spaces.Space]:
     return msg["obs_space"], msg["action_space"]
 
 
-def build_vec_env(conns: List[Connection], stack: int, *, shm_obs: bool) -> VecEnv:
+def build_actor_metadata(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    match_plan = expand_match_plan(args)
+    metadata: List[Dict[str, Any]] = []
+    for match_idx, match in enumerate(match_plan):
+        for local_idx in range(int(args.actors_per_match)):
+            metadata.append(
+                {
+                    "match_idx": match_idx,
+                    "local_idx": local_idx,
+                    "scenario": match.scenario,
+                    "map": match.map_name,
+                    "wad": match.wad,
+                }
+            )
+    return metadata
+
+
+def build_vec_env(
+    conns: List[Connection],
+    stack: int,
+    *,
+    shm_obs: bool,
+    log_level: str = "normal",
+    actor_metadata: Optional[List[Dict[str, Any]]] = None,
+) -> VecEnv:
     obs_space, action_space = fetch_spaces(conns)
-    base_env = RemoteDMVecEnv(conns, obs_space, action_space, shm_obs=shm_obs)
-    env: VecEnv = VecTransposeImage(base_env)
-    env = VecFrameStack(env, n_stack=int(stack), channels_order="first")
+    base_env = RemoteDMVecEnv(
+        conns,
+        obs_space,
+        action_space,
+        shm_obs=shm_obs,
+        log_level=log_level,
+        actor_metadata=actor_metadata,
+    )
+    env: VecEnv = base_env
+    channels_order: Any = {"image": "first", "state": None} if isinstance(obs_space, spaces.Dict) else "first"
+    env = VecFrameStack(env, n_stack=int(stack), channels_order=channels_order)
     return env
 
 
@@ -975,10 +1378,17 @@ def auto_adjust_n_steps(
 ) -> AgentConfig:
     import numpy as _np
 
-    obs_shape = env.observation_space.shape
+    def _space_elems(space: spaces.Space) -> int:
+        if isinstance(space, spaces.Dict):
+            return int(sum(_space_elems(subspace) for subspace in space.spaces.values()))
+        if hasattr(space, "shape") and space.shape is not None:
+            return int(_np.prod(space.shape))
+        raise RuntimeError(f"[TRAIN][FATAL] observation_space sem shape suportado: {space!r}")
+
+    obs_shape = getattr(env.observation_space, "shape", None)
     n_envs = env.num_envs
 
-    obs_elems = int(_np.prod(obs_shape))
+    obs_elems = _space_elems(env.observation_space)
     bytes_per_elem = 4
     target_bytes = max_rollout_gib * (1024**3)
 
@@ -1019,7 +1429,7 @@ def build_model(
     *,
     warmstart_reset_steps: bool = False,
 ):
-    algo_cls = resolve_algo(agent_cfg.policy.algo)
+    algo_cls = resolve_effective_algo(agent_cfg.policy.algo, agent_cfg.policy.learn_kwargs)
     print("[DEBUG] learn_kwargs:", agent_cfg.policy.learn_kwargs)
     if os.path.exists(save_path):
         if warmstart_reset_steps:
@@ -1109,13 +1519,67 @@ def _set_chunk_ent_coef(model, target_total_steps: int) -> None:
     )
 
 
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        if value is None:
+            return int(default)
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _resolve_training_chunk_stats(model: Any, agent_cfg: AgentConfig, env: VecEnv, remaining: int) -> Dict[str, Any]:
+    learner_lk = dict(agent_cfg.policy.learn_kwargs)
+    num_envs = max(1, _coerce_int(getattr(env, "num_envs", None), 1))
+    effective_n_steps = max(
+        1,
+        _coerce_int(getattr(model, "n_steps", learner_lk.get("n_steps", 1)), 1),
+    )
+    batch_size = max(
+        1,
+        _coerce_int(getattr(model, "batch_size", learner_lk.get("batch_size", effective_n_steps)), effective_n_steps),
+    )
+    n_epochs = max(
+        1,
+        _coerce_int(getattr(model, "n_epochs", learner_lk.get("n_epochs", 1)), 1),
+    )
+    rollout_size = max(1, num_envs * effective_n_steps)
+    rollouts_estimated = int(math.ceil(max(0, remaining) / rollout_size)) if remaining > 0 else 0
+    minibatches_per_rollout = int(math.ceil(rollout_size / batch_size))
+    minibatches_estimated = rollouts_estimated * minibatches_per_rollout
+    updates_per_rollout = minibatches_per_rollout * n_epochs
+    updates_estimated = minibatches_estimated * n_epochs
+
+    return {
+        "num_envs": num_envs,
+        "effective_n_steps": effective_n_steps,
+        "rollout_size": rollout_size,
+        "batch_size": batch_size,
+        "n_epochs": n_epochs,
+        "rollouts_estimated": rollouts_estimated,
+        "minibatches_per_rollout": minibatches_per_rollout,
+        "updates_per_rollout": updates_per_rollout,
+        "minibatches_estimated": minibatches_estimated,
+        "updates_estimated": updates_estimated,
+    }
+
+
 def train_distributed(
     agent_cfg: AgentConfig,
     env: VecEnv,
     *,
     warmstart_reset_steps: bool = False,
+    log_level: str = "normal",
+    progress_bar: bool = False,
 ) -> None:
     agent_cfg = replace(agent_cfg, train=True)
+    learner_lk = dict(agent_cfg.policy.learn_kwargs)
+    cuda_status = configure_cuda_runtime(
+        benchmark=bool(learner_lk.get("use_cudnn_benchmark", True)),
+        tf32=bool(learner_lk.get("use_tf32", False)),
+        matmul_precision=str(learner_lk.get("torch_matmul_precision", "highest")),
+    )
+    print(f"[TRAIN] {cuda_status}", flush=True)
 
     agent_cfg = auto_adjust_n_steps(
         agent_cfg,
@@ -1151,27 +1615,141 @@ def train_distributed(
 
     print(f"[TRAIN] alvo_total={target}, ja_treinado={already}, restante={remaining}")
 
+    chunk_stats = _resolve_training_chunk_stats(model, agent_cfg, env, remaining)
+    print(
+        "[TRAIN] estimativas_iniciais: "
+        f"num_envs={chunk_stats['num_envs']}, "
+        f"effective_n_steps={chunk_stats['effective_n_steps']}, "
+        f"rollout_size={chunk_stats['rollout_size']}, "
+        f"batch_size={chunk_stats['batch_size']}, "
+        f"n_epochs={chunk_stats['n_epochs']}, "
+        f"minibatches_per_rollout={chunk_stats['minibatches_per_rollout']}, "
+        f"updates_per_rollout={chunk_stats['updates_per_rollout']}, "
+        f"minibatches_estimated={chunk_stats['minibatches_estimated']}, "
+        f"updates_estimated={chunk_stats['updates_estimated']}",
+        flush=True,
+    )
+
     chunk_max = 50_000
-    callback = DebugCallback(log_every=1_000, metrics_csv_path=metrics_csv_path)
+    callback = DebugCallback(
+        log_every=1_000,
+        metrics_csv_path=metrics_csv_path,
+        log_level=log_level,
+    )
     print(f"[TRAIN] MÃ©tricas RL em CSV: {metrics_csv_path}")
     print(f"[TRAIN] MÃ©tricas de estabilidade em CSV: {perf_csv_path}")
 
+    chunk_idx = 0
     while remaining > 0:
         cur = min(chunk_max, remaining)
         _set_chunk_lr(model, target_total_steps=target)
         _set_chunk_ent_coef(model, target_total_steps=target)
 
+        steps_before = int(getattr(model, "num_timesteps", 0))
         print(f"[TRAIN] Iniciando chunk: {cur} steps (Restam: {remaining})")
+        learn_started_at = time.perf_counter()
         model.learn(
             total_timesteps=cur,
             reset_num_timesteps=False,
             callback=callback,
-            progress_bar=True,
+            progress_bar=progress_bar,
         )
+        learn_total_s = time.perf_counter() - learn_started_at
+
+        save_started_at = time.perf_counter()
         model.save(save_path)
+        save_s = time.perf_counter() - save_started_at
+        steps_after = int(getattr(model, "num_timesteps", 0))
+        actual_steps = max(0, steps_after - steps_before)
+        rollout_size = max(1, int(chunk_stats["rollout_size"]))
+        effective_n_steps = max(1, int(chunk_stats["effective_n_steps"]))
+        rollouts_per_chunk = float(actual_steps) / float(rollout_size)
+
+        chunk_metrics_row = {
+            "chunk_idx": chunk_idx,
+            "learn_total_s": round(learn_total_s, 6),
+            "save_s": round(save_s, 6),
+            "steps_before": steps_before,
+            "steps_after": steps_after,
+            "actual_steps": actual_steps,
+            "rollouts_per_chunk": round(rollouts_per_chunk, 6),
+            "effective_n_steps": effective_n_steps,
+            "rollout_size": rollout_size,
+            "batch_size": chunk_stats["batch_size"],
+            "n_epochs": chunk_stats["n_epochs"],
+            "minibatches_per_rollout": chunk_stats["minibatches_per_rollout"],
+            "updates_per_rollout": chunk_stats["updates_per_rollout"],
+        }
+        callback.record_chunk_metrics(chunk_metrics_row)
+        print(
+            "[TRAIN][CHUNK] "
+            f"idx={chunk_idx} "
+            f"steps_before={steps_before} "
+            f"steps_after={steps_after} "
+            f"actual_steps={actual_steps} "
+            f"rollouts_per_chunk={rollouts_per_chunk:.3f} "
+            f"effective_n_steps={effective_n_steps} "
+            f"rollout_size={rollout_size} "
+            f"learn_total_s={learn_total_s:.3f}s "
+            f"save_s={save_s:.3f}s",
+            flush=True,
+        )
         remaining -= cur
+        chunk_idx += 1
 
     print("[TRAIN] Treino concluído.")
+
+
+def play_distributed(
+    agent_cfg: AgentConfig,
+    env: VecEnv,
+    *,
+    play_steps: int = 0,
+    deterministic: bool = True,
+) -> None:
+    learner_lk = dict(agent_cfg.policy.learn_kwargs)
+    cuda_status = configure_cuda_runtime(
+        benchmark=bool(learner_lk.get("use_cudnn_benchmark", True)),
+        tf32=bool(learner_lk.get("use_tf32", False)),
+        matmul_precision=str(learner_lk.get("torch_matmul_precision", "highest")),
+    )
+    print(f"[PLAY] {cuda_status}", flush=True)
+
+    save_path = os.path.join(agent_cfg.model_dir, agent_cfg.model_name)
+    if not os.path.exists(save_path):
+        raise FileNotFoundError(f"Modelo nao encontrado para assistir: {save_path}")
+
+    algo_cls = resolve_effective_algo(agent_cfg.policy.algo, learner_lk)
+    print(f"[PLAY] Carregando modelo: {save_path}", flush=True)
+    model = algo_cls.load(save_path, env=env)
+    print(
+        f"[PLAY] Modelo carregado: num_timesteps={int(getattr(model, 'num_timesteps', 0))}. "
+        "Rodando sem treino e sem salvar. Ctrl+C para parar.",
+        flush=True,
+    )
+
+    obs = env.reset()
+    steps = 0
+    reward_total = 0.0
+    done_total = 0
+    max_steps = max(0, int(play_steps))
+
+    while max_steps <= 0 or steps < max_steps:
+        action, _state = model.predict(obs, deterministic=deterministic)
+        obs, rewards, dones, _infos = env.step(action)
+        steps += 1
+        reward_total += float(np.sum(rewards))
+        done_total += int(np.count_nonzero(dones))
+        if steps % 1000 == 0:
+            print(
+                f"[PLAY] steps={steps} reward_total={reward_total:.3f} dones={done_total}",
+                flush=True,
+            )
+
+    print(
+        f"[PLAY] Finalizado: steps={steps} reward_total={reward_total:.3f} dones={done_total}",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -1189,12 +1767,28 @@ def main() -> None:
     actors: List[subprocess.Popen] = []
     try:
         actors, conns = launch_actors_staggered_and_accept(args, cfg_path=args.cfg, listener=listener)
-        env = build_vec_env(conns, stack=stack, shm_obs=bool(args.shm_obs))
-        train_distributed(
-            agent_cfg,
-            env,
-            warmstart_reset_steps=bool(args.warmstart_reset_steps),
+        actor_metadata = build_actor_metadata(args)
+        env = build_vec_env(
+            conns,
+            stack=stack,
+            shm_obs=bool(args.shm_obs),
+            log_level=str(args.log_level),
+            actor_metadata=actor_metadata,
         )
+        if bool(args.play):
+            play_distributed(
+                agent_cfg,
+                env,
+                play_steps=int(args.play_steps),
+            )
+        else:
+            train_distributed(
+                agent_cfg,
+                env,
+                warmstart_reset_steps=bool(args.warmstart_reset_steps),
+                log_level=str(args.log_level),
+                progress_bar=bool(args.progress_bar),
+            )
         env.close()
 
     except KeyboardInterrupt:

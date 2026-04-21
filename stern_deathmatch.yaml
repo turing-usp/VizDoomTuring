@@ -1,11 +1,17 @@
-name: "stern_test"
+name: "stern_test_fast_mpore"
 colorset: 5
 stack_frames: 4
 
 render_settings:
-  resolution: "RES_160X120"
+  resolution: "RES_120X90"
   format: "GRAY8"
-  hud: false
+  hud: true
+  weapon: true
+  crosshair: true
+  enemy_outline: true
+  enemy_outline_value: 255
+  enemy_outline_thickness: 2
+  enemy_outline_pattern: "checker"
 
 reward:
   engine:
@@ -21,39 +27,66 @@ reward:
     secret_reward: 0.0
 
   shaping:
-    w_frag: 1.0
-    w_health: 0.0
-    w_armor: 0.0
-    w_ammo2_cost: -0.01
-    w_damage_made: 0.05
-    w_hits: 0.0
-    w_hits_taken: 0.0
-    w_deaths: -5.0
-    step_penalty: -0.002
+    w_frag: 4.0
+    w_health: 0.03
+    w_armor: 0.01
+    w_ammo2_cost: -0.05
+    w_damage_made: 0.12
+    w_hits: 0.35
+    w_hits_taken: -0.25
+    w_deaths: -8.0
+    step_penalty: -0.006
+    wall_stuck_penalty: -0.2
+    enemy_in_view_reward: 0.02
+    w_speed: 0.01
+    idle_speed_threshold: 0.05
+    idle_penalty: -0.005
     include_engine_reward: false
+
+  wall_stuck:
+    min_move: 1.0
+    max_turn_deg: 5.0
+    persist_steps: 3
+
+  enemy_in_view:
+    check_every: 2
+    cooldown_steps: 3
+    min_area_ratio: 0.002
 
 policy:
   algo: "ppo"
-  extractor: "cnn_default"
+  extractor: "custom"
   policy_kwargs:
+    features_extractor_class: "framework.fast_extractors:StateImageExtractor"
+    features_extractor_kwargs:
+      features_dim: 384
+      image_features_dim: 256
+      state_features_dim: 128
     net_arch:
-      pi: [256,256, 256]
-      vf: [256,256, 256]
+      pi: [256, 256, 256]
+      vf: [256, 256, 256]
 
   learn_kwargs:
-    n_steps: 512
-    batch_size: 1024
-    n_epochs: 16
+    n_steps: 2048
+    batch_size: 4096
+    n_epochs: 4
+    target_kl: 0.04
     learning_rate_max: 3e-4
     learning_rate_min: 5e-5
-    gamma: 0.99
-    gae_lambda: 0.95
+    gamma: 0.95
+    gae_lambda: 0.9
     clip_range: 0.2
     vf_coef: 0.5
-    ent_coef_max: 0.30
-    ent_coef_min: 0.001
+    ent_coef_max: 0.08
+    ent_coef_min: 0.003
+    use_pinned_rollout_buffer: false
+    use_cuda_optimized_ppo: true
+    use_amp: true
+    use_torch_compile: false
+    use_cudnn_benchmark: true
+    use_tf32: true
 
 model_dir: "agents/deathmatch"
-model_name: "stern_test_ppo.zip"
+model_name: "stern_test_ppo_fast_more.zip"
 train: true
-train_steps: 20000000
+train_steps: 1000000

@@ -31,9 +31,12 @@ reward:
     w_deaths: -5.0
     step_penalty: -0.002
     wall_stuck_penalty: -0.02
-    wall_stuck_min_move: 1.0
-    wall_stuck_max_turn_deg: 5.0
     include_engine_reward: false
+
+  wall_stuck:
+    min_move: 1.0
+    max_turn_deg: 5.0
+    persist_steps: 4
 
 policy:
   algo: "ppo"

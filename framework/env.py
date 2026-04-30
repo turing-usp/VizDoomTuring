@@ -724,6 +724,8 @@ class DoomDMEnv(gym.Env):
             info: Dict[str, Any] = {
                 "engine_r": engine_r,
                 "engine_episode_count": self._engine_episode_count,
+                "frags": float(vars_snapshot.vals.get(int(GameVariable.FRAGCOUNT), 0)),
+                "deaths": float(vars_snapshot.vals.get(int(GameVariable.DEATHCOUNT), 0)),
             }
 
             terminated = False

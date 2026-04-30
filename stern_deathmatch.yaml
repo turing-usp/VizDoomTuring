@@ -89,4 +89,4 @@ policy:
 model_dir: "agents/deathmatch"
 model_name: "stern_test_ppo_fast_more.zip"
 train: true
-train_steps: 1000000
+train_steps: 12100000

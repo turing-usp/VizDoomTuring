@@ -1722,9 +1722,22 @@ def play_distributed(
     algo_cls = resolve_effective_algo(agent_cfg.policy.algo, learner_lk)
     print(f"[PLAY] Carregando modelo: {save_path}", flush=True)
     model = algo_cls.load(save_path, env=env)
+
+    target_steps = max(0, int(getattr(agent_cfg, "train_steps", 0)))
+    if target_steps > 0:
+        model.num_timesteps = max(int(getattr(model, "num_timesteps", 0)), target_steps)
+    if hasattr(model, "_current_progress_remaining"):
+        model._current_progress_remaining = 0.0
+    if hasattr(model, "exploration_rate"):
+        model.exploration_rate = 0.0
+    policy = getattr(model, "policy", None)
+    if policy is not None and hasattr(policy, "set_training_mode"):
+        policy.set_training_mode(False)
+
     print(
         f"[PLAY] Modelo carregado: num_timesteps={int(getattr(model, 'num_timesteps', 0))}. "
-        "Rodando sem treino e sem salvar. Ctrl+C para parar.",
+        "Rodando em avaliacao: deterministic=True, exploration_rate=0, sem treino e sem salvar. "
+        "Ctrl+C para parar.",
         flush=True,
     )
 

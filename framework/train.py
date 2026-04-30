@@ -95,6 +95,11 @@ def train_or_play(env_fn: Callable, n_stack: int, agent_cfg, save_path: str):
             print(f"[CLIENT][TRAIN] Treino concluído. Modelo salvo em {save_path}.")
         else:
             # Modo "play" (inferência somente)
+            if hasattr(model, "exploration_rate"):
+                model.exploration_rate = 0.0
+            policy = getattr(model, "policy", None)
+            if policy is not None and hasattr(policy, "set_training_mode"):
+                policy.set_training_mode(False)
             print(f"[CLIENT][PLAY] Iniciando jogo com modelo {save_path}.")
             obs = env.reset()
             while True:
@@ -103,6 +108,3 @@ def train_or_play(env_fn: Callable, n_stack: int, agent_cfg, save_path: str):
                 obs, _rew, dones, _infos = env.step(action)
                 if dones[0]:
                     obs = env.reset()
-
-        # Garante salvar a última versão mesmo em play (opcional, mas seguro)
-        model.save(save_path)

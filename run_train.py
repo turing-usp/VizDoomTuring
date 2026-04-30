@@ -430,8 +430,6 @@ def build_single_model_cmd_from_agents(args: argparse.Namespace) -> List[str]:
 def build_multi_model_cmd(args: argparse.Namespace) -> List[str]:
     if not args.agent:
         raise ValueError("Modo multi-model requer pelo menos um --agent YAML:COUNT.")
-    if args.match:
-        raise ValueError("Mistura de mapas (--match / train-cfg matches) ainda nao e suportada no modo multi-model.")
 
     cmd: List[str] = [
         sys.executable,
@@ -469,6 +467,8 @@ def build_multi_model_cmd(args: argparse.Namespace) -> List[str]:
         cmd.extend(["--agent", spec])
 
     _maybe_add_scenario_map_and_wad(cmd, args.scenario, args.map, args.wad)
+    if args.match:
+        _maybe_add_match_specs(cmd, args.match)
     _apply_render_flags(cmd, args.render)
     _maybe_add_shm_obs(cmd, bool(args.shm_obs))
     if args.warmstart_reset_steps:
